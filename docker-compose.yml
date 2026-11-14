@@ -7,6 +7,9 @@ services:
       - "8337:8000"          # open http://<homelab-ip>:8337
     volumes:
       - ./data:/data         # audio files + library database
+      # Watched folder: music or video files put here are added to the library
+      # by themselves (point the left side at a NAS share if you have one).
+      - ./import:/import
     environment:
       YTDLP_AUTO_UPDATE: "1" # update yt-dlp on each start (restart to fix YouTube breakage)
       DOWNLOAD_WORKERS: "2"
@@ -17,6 +20,7 @@ services:
       SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
       SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET:-}
       AI_URL: http://ai:8000 # the optional AI add-on below
+      SONG_URL: http://songs:8001
 
   # Optional AI add-on: vocal remover + text-to-music. Needs an NVIDIA card
   # (6 GB is enough) and the NVIDIA Container Toolkit on the host.
@@ -32,6 +36,29 @@ services:
       - ./data:/data         # same folder as the player: songs in, results out
     environment:
       MUSICGEN_MODEL: facebook/musicgen-small  # fits 6 GB; -medium needs more
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Song engine of the AI add-on (ACE-Step 1.5): full songs with vocals,
+  # covers and section replacement for the Remix studio.
+  songs:
+    profiles: ["ai"]
+    build:
+      context: .
+      dockerfile: ai/songs.Dockerfile
+    container_name: homelab-music-songs
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+    environment:
+      # Needed on a 6 GB card: move the main model out of graphics memory
+      # whenever another part of the engine is working.
+      ACESTEP_OFFLOAD_DIT_TO_CPU: "true"
     deploy:
       resources:
         reservations:

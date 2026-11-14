@@ -79,9 +79,39 @@ def health():
     return info
 
 
+@app.post("/unload")
+def unload():
+    """Give the graphics memory back (the song engine needs it on a 6 GB card)."""
+    with _lock:
+        _loaded.update(name=None, obj=None)
+        gc.collect()
+        if DEV == "cuda":
+            torch.cuda.empty_cache()
+    return {"ok": True}
+
+
 class SplitReq(BaseModel):
     src: str       # audio file inside /data
     out_dir: str   # folder inside /data for vocals.wav and instrumental.wav
+
+
+def split_song(src: str):
+    """Return (vocals, everything else, sample rate) as numpy (2, samples)."""
+    from demucs.apply import apply_model
+    from demucs.pretrained import get_model
+    model = use("demucs", lambda: get_model("htdemucs").to(DEV).eval())
+    wav = torch.from_numpy(read_audio(src, model.samplerate, 2))
+    ref = wav.mean(0)
+    mean, std = ref.mean(), ref.std() + 1e-8
+    with torch.no_grad():
+        # split=True works through the song in chunks, keeping memory low
+        out = apply_model(model, ((wav - mean) / std)[None], device=DEV,
+                          split=True, overlap=0.25, progress=False)[0]
+    out = out * std + mean
+    names = list(model.sources)
+    vocals = out[names.index("vocals")]
+    rest = sum(out[i] for i, n in enumerate(names) if n != "vocals")
+    return vocals.numpy(), rest.numpy(), model.samplerate
 
 
 @app.post("/separate")
@@ -89,27 +119,116 @@ def separate(req: SplitReq):
     src, out_dir = inside_data(req.src), inside_data(req.out_dir)
     os.makedirs(out_dir, exist_ok=True)
     with _lock:
-        from demucs.apply import apply_model
-        from demucs.pretrained import get_model
         if DEV == "cuda":
             torch.cuda.reset_peak_memory_stats()
-        model = use("demucs", lambda: get_model("htdemucs").to(DEV).eval())
-        wav = torch.from_numpy(read_audio(src, model.samplerate, 2))
-        ref = wav.mean(0)
-        mean, std = ref.mean(), ref.std() + 1e-8
-        with torch.no_grad():
-            # split=True works through the song in chunks, keeping memory low
-            out = apply_model(model, ((wav - mean) / std)[None], device=DEV,
-                              split=True, overlap=0.25, progress=False)[0]
-        out = out * std + mean
-        names = list(model.sources)
-        vocals = out[names.index("vocals")]
-        rest = sum(out[i] for i, n in enumerate(names) if n != "vocals")
+        vocals, rest, rate = split_song(src)
         paths = {"vocals": os.path.join(out_dir, "vocals.wav"),
                  "instrumental": os.path.join(out_dir, "instrumental.wav")}
-        write_wav(paths["vocals"], vocals.numpy(), model.samplerate)
-        write_wav(paths["instrumental"], rest.numpy(), model.samplerate)
+        write_wav(paths["vocals"], vocals, rate)
+        write_wav(paths["instrumental"], rest, rate)
         return {**paths, "peak_vram_mb": vram_peak()}
+
+
+# ---------------------------------------------------------------- mashup
+# The music of one song with the vocals of others on top. The vocals are
+# stretched to the music's tempo, moved into its key and lined up on its beat.
+_MAJOR = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66,
+                   2.29, 2.88])
+_MINOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69,
+                   3.34, 3.17])
+
+
+def analyse(path: str) -> dict:
+    """Tempo, time of the first beat and key of a song."""
+    import librosa
+    y = read_audio(path, 22050, 1)[0]
+    tempo, beats = librosa.beat.beat_track(y=y, sr=22050)
+    times = librosa.frames_to_time(beats, sr=22050)
+    chroma = librosa.feature.chroma_stft(y=y, sr=22050).mean(axis=1)
+    _, tonic, minor = max(
+        (float(np.corrcoef(np.roll(profile, k), chroma)[0, 1]), k, minor)
+        for k in range(12) for minor, profile in ((False, _MAJOR),
+                                                  (True, _MINOR)))
+    return {"bpm": float(np.atleast_1d(tempo)[0]) or 120.0,
+            "first": float(times[0]) if len(times) else 0.0,
+            # a minor key is treated as its relative major: same notes
+            "key": (tonic + 3) % 12 if minor else tonic}
+
+
+def stretch(audio: np.ndarray, rate: int, tempo: float, semitones: int,
+            tmp: str) -> np.ndarray:
+    """Change speed and pitch independently (vocals keep their character)."""
+    if abs(tempo - 1) < 0.005 and not semitones:
+        return audio
+    src = os.path.join(tmp, "stretch_in.wav")
+    write_wav(src, audio, rate)
+    pitch = 2 ** (semitones / 12)
+    for af in (f"rubberband=tempo={tempo:.5f}:pitch={pitch:.5f}:"
+               "formant=preserved",
+               f"asetrate={rate * pitch:.0f},aresample={rate},"
+               f"atempo={tempo / pitch:.5f}"):   # fallback without rubberband
+        r = subprocess.run(["ffmpeg", "-v", "error", "-i", src, "-af", af,
+                            "-f", "f32le", "-ac", "2", "-ar", str(rate), "-"],
+                           capture_output=True)
+        if r.returncode == 0 and r.stdout:
+            return np.frombuffer(r.stdout, dtype=np.float32).reshape(-1, 2).T
+    raise HTTPException(500, "Could not time-stretch the vocals")
+
+
+class MashupReq(BaseModel):
+    base: str            # its music is kept
+    vocals: list[str]    # their vocals go on top, one after another
+    out: str
+
+
+@app.post("/mashup")
+def mashup(req: MashupReq):
+    base = inside_data(req.base)
+    others = [inside_data(p) for p in req.vocals]
+    out = inside_data(req.out)
+    if not others:
+        raise HTTPException(400, "Pick at least two songs")
+    tmp = os.path.dirname(out)
+    os.makedirs(tmp, exist_ok=True)
+    with _lock:
+        if DEV == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+        _, music, rate = split_song(base)
+        a0 = analyse(base)
+        n = music.shape[1]
+        voice = np.zeros((2, n), dtype=np.float32)
+        fade = int(rate * 0.05)
+        info = []
+        for i, path in enumerate(others):
+            v, _, _ = split_song(path)
+            a = analyse(path)
+            tempo = a0["bpm"] / a["bpm"]
+            while tempo > 1.42:      # 70 vs 140 bpm is the same beat
+                tempo /= 2
+            while tempo < 0.71:
+                tempo *= 2
+            semis = (a0["key"] - a["key"] + 6) % 12 - 6
+            v = stretch(v, rate, tempo, semis, tmp)
+            # line the vocal's beat grid up with the music's
+            delay = (a0["first"] - a["first"] / tempo) % (60 / a0["bpm"])
+            v = np.pad(v, ((0, 0), (int(delay * rate), 0)))
+            # each vocal gets its own stretch of the song
+            start, end = n * i // len(others), n * (i + 1) // len(others)
+            seg = v[:, start:end].copy()
+            if seg.shape[1] > 2 * fade:
+                ramp = np.linspace(0, 1, fade, dtype=np.float32)
+                seg[:, :fade] *= ramp
+                seg[:, -fade:] *= ramp[::-1]
+            voice[:, start:start + seg.shape[1]] = seg
+            info.append({"tempo": round(tempo, 3), "semitones": int(semis),
+                         "bpm": round(a["bpm"], 1)})
+        loud = np.abs(voice) > 1e-3
+        v_rms = float(np.sqrt((voice[loud] ** 2).mean())) if loud.any() else 0
+        m_rms = float(np.sqrt((music ** 2).mean())) or 1e-6
+        gain = min(2.5, max(0.6, 1.1 * m_rms / v_rms)) if v_rms else 1.0
+        write_wav(out, 0.85 * music + gain * voice, rate)
+        return {"out": out, "base_bpm": round(a0["bpm"], 1), "vocals": info,
+                "peak_vram_mb": vram_peak()}
 
 
 class GenReq(BaseModel):

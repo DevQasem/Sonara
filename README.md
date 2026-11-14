@@ -4,6 +4,25 @@ Self-hosted web music player for your LAN. Works on desktop and phones.
 
 ## Features
 
+- **One library for everything**: YouTube, Spotify and your own files sit
+  side by side, each with a small badge (YT, SP, LOCAL). Filter chips narrow
+  Home and any list to one source or to videos only.
+- **Colours from the cover**: the whole player takes its colours and a
+  blurred backdrop from the song that is playing (switch off in Settings →
+  Appearance).
+- **One search**: the search box looks in your library, on YouTube and on
+  Spotify at the same time. Searching Spotify needs the free API keys from
+  Settings → Accounts; pasting a Spotify link works without them.
+- **Watched folder**: music or video files copied into `./import` join the
+  library within a minute. A sub-folder becomes a folder in the player. The
+  files are linked or copied, never moved or deleted.
+- **Remix**: change speed, bass, reverb and 8D live and save the result as a
+  new song. With the AI add-on: split vocals from music, make a **mashup**
+  (the music of one song with the vocals of up to three others, matched in
+  tempo and key), or create a short instrumental from a description.
+- **Phone**: bottom tabs, a floating mini player, swipe it up for the full
+  player, sideways to change song, and swipe the full player down to close.
+
 - **YouTube**: search, single videos, playlists, YouTube Music links.
 - **Spotify**: track / album / playlist links. Spotify audio is DRM-protected
   and cannot be downloaded, so the app reads the track list from Spotify and
@@ -207,3 +226,17 @@ The first build downloads PyTorch (several GB). The models themselves
 `MUSICGEN_MODEL` in `docker-compose.yml` picks the music model. The default,
 `facebook/musicgen-small`, fits 6 GB; `facebook/musicgen-medium` sounds
 better but needs a larger card.
+
+### Song engine (Remix → Create)
+
+The same `--profile ai` command also starts a third container, `songs`,
+running [ACE-Step 1.5](https://github.com/ACE-Step/ACE-Step-1.5). It makes
+**full songs with singing** from a style description and your lyrics, **covers**
+of songs in your library, and **re-makes one part** of a song. It is set up
+for a 6 GB card (the 2B "turbo" model without the language model, parked in
+normal memory between jobs).
+
+The first build clones ACE-Step and installs its dependencies (several GB);
+the first start downloads about 10 GB of models into `./data/ai_models`.
+Without it, the rest of the studio (effects, split, mashup, quick beat)
+still works and the Create tab says the song engine is not running.

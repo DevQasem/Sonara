@@ -65,28 +65,74 @@ const EQ_PRESETS = {
   Acoustic: [5, 5, 3, 1, 2, 2, 3, 4, 3, 2],
   'Late night': [4, 3, 1, 0, 1, 2, 2, 1, -2, -4],
 };
-const prefs = Object.assign({ theme: 'dark', accent: ACCENTS[0][0], anim: true, compact: false, speed: 1, eq: EQ_PRESETS.Flat.slice(), eqOn: true, eqPreset: 'Flat', viz: 'bars', ytMode: 'ask', avMode: 'video', resume: true, sort: 'default', volume: 1, panel: true }, load('prefs', {}));
+const prefs = Object.assign({ theme: 'dark', accent: ACCENTS[0][0], anim: true, compact: false, speed: 1, eq: EQ_PRESETS.Flat.slice(), eqOn: true, eqPreset: 'Flat', viz: 'bars', ytMode: 'ask', avMode: 'video', resume: true, sort: 'default', volume: 1, panel: true, src: 'all', coverTheme: true, studio: 'create' }, load('prefs', {}));
 if (!Array.isArray(prefs.eq) || prefs.eq.length !== EQ_F.length) { prefs.eq = EQ_PRESETS.Flat.slice(); prefs.eqPreset = 'Flat'; }
 function load(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } }
 function save(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
 let vizColors = ['#8b5cf6', '#ec4899'];
 function applyPrefs() {
   root.dataset.theme = prefs.theme;
-  const pair = ACCENTS.find(a => a[0] === prefs.accent);
-  root.style.setProperty('--accent', prefs.accent);
-  root.style.setProperty('--accent2', pair ? pair[1] : `color-mix(in srgb, ${prefs.accent} 55%, #ff4d8d)`);
   document.body.classList.toggle('anim', prefs.anim);
   document.body.classList.toggle('compact', prefs.compact);
   document.body.classList.toggle('viz-circle', prefs.viz === 'circle');
   document.body.classList.toggle('viz-off', prefs.viz === 'off');
-  const cs = getComputedStyle(root);
-  vizColors = [cs.getPropertyValue('--accent').trim() || '#8b5cf6', cs.getPropertyValue('--accent2').trim() || '#ec4899'];
-  if (!vizColors[1].startsWith('#')) vizColors[1] = vizColors[0];
   applyRemix();
   audio.volume = prefs.volume;
   $('vol').value = prefs.volume; fill($('vol'));
   applyEq();
   save('prefs', prefs);
+  themeFromCover(current() || null);
+}
+
+// The whole app takes its colours from the cover of the song that is playing.
+const hsl2hex = (h, s, l) => {
+  s /= 100; l /= 100;
+  const a = s * Math.min(l, 1 - l), f = n => { const k = (n + h / 30) % 12; return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1)); };
+  return '#' + [f(0), f(8), f(4)].map(x => Math.round(x * 255).toString(16).padStart(2, '0')).join('');
+};
+function setAccent(c1, c2) {
+  root.style.setProperty('--accent', c1); root.style.setProperty('--accent2', c2);
+  if (c1.startsWith('#')) vizColors = [c1, c2.startsWith('#') ? c2 : c1];
+}
+function baseAccent() {
+  const pair = ACCENTS.find(a => a[0] === prefs.accent);
+  setAccent(prefs.accent, pair ? pair[1] : `color-mix(in srgb, ${prefs.accent} 55%, #ff4d8d)`);
+}
+let themeSeq = 0;
+function themeFromCover(t) {
+  const seq = ++themeSeq, url = t ? coverUrl(t) : '';
+  // the blurred cover behind everything
+  root.style.setProperty('--cover', t && !url.startsWith('data:') ? `url("${url}")` : 'none');
+  if (!t || !prefs.coverTheme || url.startsWith('data:')) return baseAccent();
+  const img = new Image();
+  img.onerror = () => { if (seq === themeSeq) baseAccent(); };
+  img.onload = () => {
+    if (seq !== themeSeq) return;
+    const c = document.createElement('canvas'); c.width = c.height = 32;
+    const g = c.getContext('2d', { willReadFrequently: true });
+    let d;
+    try { g.drawImage(img, 0, 0, 32, 32); d = g.getImageData(0, 0, 32, 32).data; } catch { return baseAccent(); }
+    // weigh the colourful pixels by hue, in twelve 30-degree slices
+    const bins = new Array(12).fill(0);
+    for (let i = 0; i < d.length; i += 4) {
+      const r = d[i], gr = d[i + 1], b = d[i + 2], max = Math.max(r, gr, b), min = Math.min(r, gr, b);
+      const l = (max + min) / 510, s = max === min ? 0 : (max - min) / (255 - Math.abs(max + min - 255));
+      if (s < 0.25 || l < 0.15 || l > 0.9) continue;
+      let h = max === r ? ((gr - b) / (max - min)) % 6 : max === gr ? (b - r) / (max - min) + 2 : (r - gr) / (max - min) + 4;
+      h = (h * 60 + 360) % 360;
+      bins[Math.floor(h / 30) % 12] += s;
+    }
+    const order = bins.map((w, k) => [w, k]).sort((x, y) => y[0] - x[0]);
+    if (order[0][0] < 12) return baseAccent();  // a grey cover: keep the chosen accent
+    const k1 = order[0][1];
+    const second = order.find(([w, k]) => w > order[0][0] * 0.25 && Math.min(Math.abs(k - k1), 12 - Math.abs(k - k1)) >= 2);
+    const h1 = k1 * 30 + 15, h2 = second ? second[1] * 30 + 15 : (h1 + 45) % 360;
+    setAccent(hsl2hex(h1, 74, 62), hsl2hex(h2, 76, 58));
+  };
+  // YouTube covers come through the server so their pixels may be read;
+  // covers from other sites are asked for with permission to read them
+  if (/^https?:/.test(url) && t.cover) img.crossOrigin = 'anonymous';
+  img.src = !t.cover && t.video_id ? `/api/thumb/${t.video_id}` : url;
 }
 
 // ---------------------------------------------------------------- state
@@ -108,7 +154,7 @@ const state = {
 };
 const current = () => state.queue[state.index];
 // library tracks have an id; streamed (not downloaded) tracks only a video id
-const tkey = t => t.id ?? 'yt:' + t.video_id;
+const tkey = t => t.id ?? t.key ?? 'yt:' + t.video_id;
 // A song can have both sound and picture: library tracks with a video file,
 // uploaded videos, and anything streamed from YouTube.
 const canVideo = t => !t.id || t.kind === 'video';
@@ -143,7 +189,7 @@ function placeholder(t) {
   const h = hue(t.title + t.id);
   return 'data:image/svg+xml,' + encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="hsl(${h},65%,48%)"/><stop offset="1" stop-color="hsl(${(h + 50) % 360},65%,30%)"/></linearGradient></defs><rect width="96" height="96" fill="url(#g)"/><path transform="translate(24 24) scale(2)" fill="rgba(255,255,255,.85)" d="${ICONS.music}"/></svg>`);
 }
-const coverUrl = t => t.video_id ? `https://i.ytimg.com/vi/${t.video_id}/mqdefault.jpg` : t.source === 'upload' || t.source === 'remix' ? `/api/cover/${t.id}` : placeholder(t);
+const coverUrl = t => t.cover ? t.cover : t.video_id ?`https://i.ytimg.com/vi/${t.video_id}/mqdefault.jpg` : t.source === 'upload' || t.source === 'remix' ? `/api/cover/${t.id}` : placeholder(t);
 function setImg(img, t) { img.onerror = () => { img.onerror = null; img.src = placeholder(t); }; img.src = coverUrl(t); }
 function fill(r) { const max = +r.max || 1, min = +r.min || 0; r.style.setProperty('--p', ((r.value - min) / (max - min) * 100) + '%'); }
 
@@ -249,6 +295,10 @@ function trackMenu(t, anchor) {
     try { await post('/api/add', { video_id: t.video_id, title: t.title, artist: t.artist, duration: t.duration, kind: 'video' }); state.wasPending = true; toast(`Downloading the video for “${t.title}”`); reload(true); }
     catch (e) { toast(e.message, 'error'); }
   } });
+  if (t.status === 'ready') items.push({ icon: 'download', label: 'Save file to this device', fn: () => {
+    const a = el('a'); a.href = `/media/${t.id}`; a.download = `${t.artist ? t.artist + ' - ' : ''}${t.title}`.replace(/[\\/:*?"<>|]/g, '_');
+    a.click();
+  } });
   items.push({ icon: 'edit', label: 'Edit title / artist', fn: () => editTrack(t) });
   if (t.status === 'error') items.push({ icon: 'retry', label: 'Retry download', fn: async () => { await post(`/api/tracks/${t.id}/retry`); state.wasPending = true; reload(true); } });
   items.push({ icon: 'trash', label: 'Delete from library', danger: true, fn: () => deleteTrack(t) });
@@ -281,6 +331,7 @@ function stopPlayer() {
   $('nowT').textContent = $('npT').textContent = 'Nothing playing';
   $('nowA').textContent = 'Pick a song to start'; $('npA').textContent = '';
   $('art').removeAttribute('src'); $('npArt').removeAttribute('src');
+  themeFromCover(null);
   $('npBg').style.backgroundImage = '';
   $('saveBtn').hidden = $('npSave').hidden = $('likeBtn').hidden = $('npLike').hidden = $('fsBtn').hidden = true;
   document.body.classList.remove('is-video'); $('avTabs').hidden = true;
@@ -313,7 +364,8 @@ function askKind(anchor, title, labels, fn) {
 // straight into a folder.
 async function saveStream(t, folder = null, quiet = false) {
   try {
-    await post('/api/add', { video_id: t.video_id, title: t.title, artist: t.artist, duration: t.duration, kind: 'video', playlist: folder });
+    if (t.sp_id) await post('/api/spotify/add', { id: t.sp_id, title: t.title, artist: t.artist, duration: t.duration, playlist: folder });
+    else await post('/api/add', { video_id: t.video_id, title: t.title, artist: t.artist, duration: t.duration, kind: 'video', playlist: folder });
     t.in_library = true; state.wasPending = true;
     if (!quiet) toast(`Downloading “${t.title}” to your library`);
     if (current() && tkey(current()) === tkey(t)) $('saveBtn').hidden = $('npSave').hidden = true;
@@ -454,16 +506,32 @@ $('main').addEventListener('contextmenu', e => {
 
 $('main').addEventListener('pointerdown', e => {
   const main = $('main');
-  if (e.button !== 0 || e.pointerType !== 'mouse' || !main.querySelector('.row')) return;
+  if (e.button !== 0 || e.pointerType !== 'mouse') return;
+  const base = { x: e.clientX, y: e.clientY, cx: e.clientX, cy: e.clientY, top: e.clientY + main.scrollTop, id: e.pointerId };
+  // a card that carries a song (Home shelves) is picked up whole
+  const card = e.target.closest('.card');
+  if (card && card._track) { drag = { ...base, card, grab: true }; return; }
+  if (!main.querySelector('.row')) return;
   if (e.target.closest('button, input, select, a')) return;
   if (e.clientX >= main.getBoundingClientRect().left + main.clientWidth) return;  // the scrollbar
   const row = e.target.closest('.row'), add = e.ctrlKey || e.metaKey || e.shiftKey;
   drag = {
-    x: e.clientX, y: e.clientY, cx: e.clientX, cy: e.clientY, top: e.clientY + main.scrollTop, row, add, id: e.pointerId,
+    ...base, row, add,
     // a selected row, or a track's cover / name, is picked up; anywhere else draws the box
     grab: !!row && !add && (picked.has(row.dataset.key) || !!e.target.closest('img, .t, .a')),
   };
 });
+// What follows the mouse while songs are dragged: cover, name, how many.
+function makeGhost(tracks) {
+  const g = el('div', 'drag-ghost'), img = el('img'), txt = el('div'), one = tracks[0];
+  img.alt = ''; setImg(img, one);
+  txt.append(el('b', null, tracks.length === 1 ? one.title : `${tracks.length} songs`), el('small'));
+  g.append(img, txt);
+  if (tracks.length > 1) g.append(el('span', 'count', tracks.length));
+  return g;
+}
+// Songs can be dropped between the rows of an open folder shown in its own order.
+const canPlace = () => state.view.type === 'playlist' && prefs.sort === 'default' && prefs.src === 'all' && !state.filter.trim() && drag.tracks.every(t => t.id);
 addEventListener('pointermove', e => {
   if (!drag) return;
   drag.cx = e.clientX; drag.cy = e.clientY;
@@ -476,38 +544,54 @@ addEventListener('pointermove', e => {
       drag.base = drag.add ? new Set(picked) : new Set();
       drag.el = el('div', 'marquee');
       document.body.classList.add('dragsel');
-      requestAnimationFrame(boxScroll);
     } else {
-      const key = drag.row.dataset.key;
-      drag.tracks = picked.has(key) ? pickedTracks() : state.shown.filter(t => String(tkey(t)) === key);
-      const one = drag.tracks[0];
-      drag.el = el('div', 'drag-ghost', drag.tracks.length === 1 ? one.title + (one.artist ? ' • ' + one.artist : '') : `${drag.tracks.length} tracks`);
+      const key = drag.row && drag.row.dataset.key;
+      drag.tracks = drag.card ? [drag.card._track] : picked.has(key) ? pickedTracks() : state.shown.filter(t => String(tkey(t)) === key);
+      drag.el = makeGhost(drag.tracks);
+      drag.line = el('div', 'drop-line'); drag.line.hidden = true;
+      document.body.append(drag.line);
       document.body.classList.add('dragsel', 'moving');
-      // inside a folder shown in its own order, tracks can also be dropped
-      // between rows to rearrange them
-      if (state.view.type === 'playlist' && prefs.sort === 'default' && !state.filter.trim() && drag.tracks.every(t => t.id)) {
-        drag.line = el('div', 'drop-line'); drag.line.hidden = true; document.body.append(drag.line);
-        requestAnimationFrame(boxScroll);
-      }
+      // the songs being carried fade where they were
+      drag.lifted = drag.card ? [drag.card] : rowEls().filter(r => drag.tracks.some(t => String(tkey(t)) === r.dataset.key));
+      drag.lifted.forEach(n => n.classList.add('lifted'));
     }
     document.body.append(drag.el);
+    requestAnimationFrame(boxScroll);
   }
   if (drag.mode === 'box') return drawBox();
   drag.el.style.left = e.clientX + 14 + 'px'; drag.el.style.top = e.clientY + 12 + 'px';
   const over = dropTarget(e);
-  $$('.drop-on').forEach(n => { if (n !== over) n.classList.remove('drop-on'); });
-  over?.classList.add('drop-on');
-  if (!drag.line) return;
+  if (over !== drag.over) {  // moved onto or off a folder
+    clearTimeout(drag.spring);
+    $$('.drop-on').forEach(n => n.classList.remove('drop-on', 'spring'));
+    drag.over = over;
+    if (over) {
+      over.classList.add('drop-on');
+      // resting on a folder opens it, so the songs can be put at an exact place
+      const pid = +over.dataset.id, p = state.playlists.find(x => x.id === pid);
+      if (p && !(state.view.type === 'playlist' && state.view.id === pid) && drag.tracks.every(t => t.id)) {
+        over.classList.add('spring');
+        drag.spring = setTimeout(() => {
+          if (!drag || drag.over !== over) return;
+          over.classList.remove('spring');
+          go({ type: 'playlist', id: p.id, name: p.name, source: p.source });
+        }, 900);
+      }
+    }
+  }
   drag.at = null;
   const rows = rowEls(), m = $('main').getBoundingClientRect();
-  if (!over && rows.length && e.clientX > m.left && e.clientX < m.right && e.clientY > m.top && e.clientY < m.bottom) {
+  if (!over && canPlace() && e.clientX > m.left && e.clientX < m.right && e.clientY > m.top && e.clientY < m.bottom) {
     let i = rows.findIndex(r => e.clientY < r.getBoundingClientRect().top + r.offsetHeight / 2);
     if (i < 0) i = rows.length;
     drag.at = i;
-    const q = rows[Math.min(i, rows.length - 1)].getBoundingClientRect();
-    Object.assign(drag.line.style, { left: q.left + 'px', width: q.width + 'px', top: (i < rows.length ? q.top : q.bottom) - 1 + 'px' });
+    const q = rows.length ? rows[Math.min(i, rows.length - 1)].getBoundingClientRect() : $('rows').getBoundingClientRect();
+    Object.assign(drag.line.style, { left: q.left + 'px', width: q.width + 'px', top: (i < rows.length || !rows.length ? q.top : q.bottom) - 1 + 'px' });
   }
   drag.line.hidden = drag.at == null;
+  // the label under the title says what letting go will do
+  const one = drag.tracks[0], folder = over && state.playlists.find(x => x.id === +over.dataset.id);
+  drag.el.querySelector('small').textContent = folder ? `Add to “${folder.name}”` : over ? 'Add to a new folder' : drag.at != null ? `Put here in “${state.view.name}”` : drag.tracks.length === 1 ? (one.artist || '') : `${one.title} and more`;
 });
 // Move tracks to a new place in the folder that is open.
 async function reorder(moved, at) {
@@ -521,6 +605,23 @@ async function reorder(moved, at) {
   catch (e) { toast(e.message, 'error'); }
   reload(true);
 }
+// Drop songs at a chosen place in the open folder; ones that are not in the
+// folder yet are added to it first.
+async function placeInFolder(moved, at) {
+  const v = state.view, have = new Set(state.shown.map(t => t.id)), fresh = moved.filter(t => !have.has(t.id));
+  if (fresh.length) {
+    let ok = 0;
+    for (const t of fresh) {
+      try { await post(`/api/playlists/${v.id}/tracks`, { track_id: t.id }); ok++; }
+      catch (e) { toast(e.message, 'error'); }
+    }
+    if (ok) toast(`Added ${ok} song${ok === 1 ? '' : 's'} to “${v.name}”`);
+    await reload(true);
+    if (state.view !== v) return;
+  }
+  const order = moved.map(t => state.shown.find(x => x.id === t.id)).filter(Boolean);
+  if (order.length) reorder(order, Math.min(at, state.shown.length));
+}
 function dropTarget(e) { return document.elementFromPoint(e.clientX, e.clientY)?.closest('#pls .nav, .side-h') || null; }
 function drawBox() {
   const main = $('main'), m = main.getBoundingClientRect(), y0 = drag.top - main.scrollTop;
@@ -533,27 +634,52 @@ function drawBox() {
 }
 function boxScroll() {  // keep scrolling while the mouse is held near the top or bottom edge
   if (!drag || !drag.mode) return;
-  const main = $('main'), m = main.getBoundingClientRect();
-  const step = drag.cy < m.top + 28 ? -16 : drag.cy > m.bottom - 28 ? 16 : 0;
-  if (step && drag.cx > m.left && drag.cx < m.right) { main.scrollBy({ top: step, behavior: 'instant' }); if (drag.mode === 'box') drawBox(); }
+  const edge = (box, x, y) => { const m = box.getBoundingClientRect(); return x > m.left && x < m.right ? (y < m.top + 28 ? -16 : y > m.bottom - 28 ? 16 : 0) : 0; };
+  const main = $('main'), side = document.querySelector('.side');
+  let step = edge(main, drag.cx, drag.cy);
+  if (step) { main.scrollBy({ top: step, behavior: 'instant' }); if (drag.mode === 'box') drawBox(); }
+  else if (drag.mode === 'move' && (step = edge(side, drag.cx, drag.cy))) side.scrollBy({ top: step / 2, behavior: 'instant' });  // a long folder list
   requestAnimationFrame(boxScroll);
+}
+// The carried songs shrink into the folder they were dropped on.
+const settle = (anim, ms) => Promise.race([anim.finished.catch(() => {}), new Promise(r => setTimeout(r, ms + 150))]);
+function flyInto(ghost, target) {
+  const g = ghost.getBoundingClientRect(), t = target.getBoundingClientRect();
+  const dx = t.left + 22 - g.left, dy = t.top + t.height / 2 - (g.top + 20);
+  const a = ghost.animate([
+    { transform: 'rotate(-2deg) scale(1)', opacity: 1 },
+    { transform: `translate(${dx * 0.6}px,${dy * 0.6 - 14}px) rotate(-6deg) scale(.6)`, opacity: 1, offset: 0.55 },
+    { transform: `translate(${dx}px,${dy}px) rotate(0deg) scale(.12)`, opacity: 0.2 },
+  ], { duration: 360, easing: 'cubic-bezier(.4,0,.2,1)', fill: 'forwards' });
+  return settle(a, 360).then(() => ghost.remove());
+}
+function ghostAway(ghost) {
+  const a = ghost.animate([{ opacity: 1, transform: 'rotate(-2deg) scale(1)' }, { opacity: 0, transform: 'rotate(0deg) scale(.85)' }], { duration: 170, fill: 'forwards' });
+  settle(a, 170).then(() => ghost.remove());
 }
 function endDrag(e) {
   const d = drag; drag = null;
   if (!d) return;
   if (!d.mode) {  // a plain click: on empty space it clears the selection
-    if (!d.row && !d.add && picked.size) setPicked([]);
+    if (!d.row && !d.card && !d.add && picked.size) setPicked([]);
     return;
   }
   dragEnd = performance.now();
-  d.el.remove(); d.line?.remove();
+  clearTimeout(d.spring);
+  d.line?.remove();
+  (d.lifted || []).forEach(n => n.classList.remove('lifted'));
   document.body.classList.remove('dragsel', 'moving');
-  $$('.drop-on').forEach(n => n.classList.remove('drop-on'));
-  if (d.mode !== 'move' || e.type !== 'pointerup') return;
-  const over = dropTarget(e);
-  if (!over) { if (d.at != null) reorder(d.tracks, d.at); return; }
-  if (over.matches('.side-h')) newFolder().then(p => { if (p) addToFolder(p, d.tracks); });
-  else { const p = state.playlists.find(x => x.id === +over.dataset.id); if (p) addToFolder(p, d.tracks); }
+  $$('.drop-on').forEach(n => n.classList.remove('drop-on', 'spring'));
+  if (d.mode !== 'move') { d.el.remove(); return; }
+  const dropped = e.type === 'pointerup', over = dropped ? dropTarget(e) : null;
+  if (!over) {
+    if (dropped && d.at != null) { d.el.remove(); placeInFolder(d.tracks, d.at); } else ghostAway(d.el);
+    return;
+  }
+  if (over.matches('.side-h')) { ghostAway(d.el); newFolder().then(p => { if (p) addToFolder(p, d.tracks); }); return; }
+  const p = state.playlists.find(x => x.id === +over.dataset.id);
+  if (!p) return ghostAway(d.el);
+  flyInto(d.el, over).then(() => { state.pulse = p.id; addToFolder(p, d.tracks); });
 }
 addEventListener('pointerup', endDrag);
 addEventListener('pointercancel', endDrag);
@@ -635,7 +761,7 @@ function renderTrackShell() {
   s.value = prefs.sort; s.onchange = () => { prefs.sort = s.value; save('prefs', prefs); drawTracks(); };
   tools.append(f, s);
   const rows = el('div'); rows.id = 'rows';
-  main.append(tools, rows);
+  main.append(srcChips(drawTracks), tools, rows);
 }
 
 let reloadSeq = 0;
@@ -656,11 +782,43 @@ async function reload(force) {
   drawTracks();
 }
 
+// One row for a song in the library.
+function trackRow(t, i) {
+  const row = el('div', 'row'), cur = current();
+  row.dataset.key = tkey(t);
+  row.style.animationDelay = Math.min(i, 10) * 12 + 'ms';
+  const img = el('img'); img.loading = 'lazy'; img.alt = ''; setImg(img, t);
+  const meta = el('div');
+  const title = el('div', 't', t.title), badge = srcBadge(t);
+  if (badge) title.append(badge);
+  if (t.kind === 'video') title.append(el('span', 'badge', 'VIDEO'));
+  let sub = t.artist || (t.source === 'upload' ? 'Local file' : '');
+  if (state.view.type === 'top' && t.plays) sub += `${sub ? ' · ' : ''}${t.plays} play${t.plays === 1 ? '' : 's'}`;
+  const a = el('div', 'a');
+  if (t.artist) { artistLinks(a, t.artist); a.append(sub.slice(t.artist.length)); } else a.textContent = sub;
+  meta.append(title, a);
+  const tag = el('div');
+  if (t.status === 'ready') {
+    const h = el('button', 'icon-btn heart'); paintHeart(h, t.liked);
+    h.onclick = e => { e.stopPropagation(); toggleLike(t); };
+    tag.append(h);
+  }
+  if (t.status !== 'ready') { const s = el('span', 'tag ' + t.status, dlText(t)); if (t.error) s.title = t.error; tag.append(s); row.classList.add('dim'); }
+  const more = btn('icon-btn', 'more', '', e => { e.stopPropagation(); trackMenu(t, e.currentTarget); });
+  more.title = 'More';
+  if (t.status === 'ready') { row.classList.add('playable'); row.onclick = () => playFrom(tkey(t)); }
+  row.oncontextmenu = e => { e.preventDefault(); trackMenu(t, at(e)); };
+  if (cur && tkey(cur) === tkey(t)) row.classList.add('current');
+  row.append(el('div', 'n', i + 1), img, meta, tag, el('div', 'd', t.duration ? fmt(t.duration) : ''), more);
+  return row;
+}
+
 function drawTracks() {
   const box = $('rows'); if (!box) return;
   let list = state.tracks;
   const f = state.filter.trim().toLowerCase();
   if (f) list = list.filter(t => (t.title + ' ' + (t.artist || '')).toLowerCase().includes(f));
+  if (prefs.src !== 'all') list = list.filter(t => srcMatch(t, prefs.src));
   const cmp = { title: (a, b) => a.title.localeCompare(b.title), artist: (a, b) => (a.artist || '').localeCompare(b.artist || ''), duration: (a, b) => a.duration - b.duration }[prefs.sort];
   if (cmp) list = [...list].sort(cmp);
   state.shown = list;
@@ -669,37 +827,10 @@ function drawTracks() {
   box.replaceChildren();
   if (!list.length) {
     const e = el('div', 'empty'); e.innerHTML = svg('music');
-    e.append(el('div', null, f ? 'Nothing matches that filter.' : state.view.type === 'playlist' ? 'This folder is empty. Use ⋯ on any track to add it here, or upload files.' : (LISTS[state.view.type] || { empty: 'No songs by this artist in your library.' }).empty));
+    e.append(el('div', null, f || (prefs.src !== 'all' && state.tracks.length) ? 'Nothing matches that filter.' : state.view.type === 'playlist' ? 'This folder is empty. Use ⋯ on any track to add it here, or upload files.' : (LISTS[state.view.type] || { empty: 'No songs by this artist in your library.' }).empty));
     box.append(e); return;
   }
-  const cur = current();
-  list.forEach((t, i) => {
-    const row = el('div', 'row'); row.dataset.key = tkey(t);
-    row.style.animationDelay = Math.min(i, 10) * 12 + 'ms';
-    const img = el('img'); img.loading = 'lazy'; img.alt = ''; setImg(img, t);
-    const meta = el('div');
-    const title = el('div', 't', t.title);
-    if (t.kind === 'video') title.append(el('span', 'badge', 'VIDEO'));
-    let sub = t.artist || (t.source === 'upload' ? 'Uploaded file' : '');
-    if (state.view.type === 'top' && t.plays) sub += `${sub ? ' · ' : ''}${t.plays} play${t.plays === 1 ? '' : 's'}`;
-    const a = el('div', 'a');
-    if (t.artist) { artistLinks(a, t.artist); a.append(sub.slice(t.artist.length)); } else a.textContent = sub;
-    meta.append(title, a);
-    const tag = el('div');
-    if (t.status === 'ready') {
-      const h = el('button', 'icon-btn heart'); paintHeart(h, t.liked);
-      h.onclick = e => { e.stopPropagation(); toggleLike(t); };
-      tag.append(h);
-    }
-    if (t.status !== 'ready') { const s = el('span', 'tag ' + t.status, dlText(t)); if (t.error) s.title = t.error; tag.append(s); row.classList.add('dim'); }
-    const more = btn('icon-btn', 'more', '', e => { e.stopPropagation(); trackMenu(t, e.currentTarget); });
-    more.title = 'More';
-    if (t.status === 'ready') { row.classList.add('playable'); row.onclick = () => playFrom(tkey(t)); }
-    row.oncontextmenu = e => { e.preventDefault(); trackMenu(t, at(e)); };
-    if (cur && tkey(cur) === tkey(t)) row.classList.add('current');
-    row.append(el('div', 'n', i + 1), img, meta, tag, el('div', 'd', t.duration ? fmt(t.duration) : ''), more);
-    box.append(row);
-  });
+  list.forEach((t, i) => box.append(trackRow(t, i)));
   const keys = new Set(list.map(t => String(tkey(t))));
   for (const k of [...picked]) if (!keys.has(k)) picked.delete(k);
   paintPicked();
@@ -712,7 +843,8 @@ function markCurrent() {
 async function loadPlaylists() {
   let list;
   try { list = await api('/api/playlists'); } catch { return; }
-  if (plDrag) return;  // a folder is being dragged: do not redraw under it
+  // a folder, or songs, are being dragged: do not redraw the list under them
+  if (plDrag || (drag && drag.mode === 'move')) return;
   state.playlists = list;
   const box = $('pls'); box.replaceChildren();
   for (const p of state.playlists) {
@@ -720,8 +852,10 @@ async function loadPlaylists() {
     b.innerHTML = svg('folder'); b.append(el('span', null, p.name), el('small', null, p.count));
     b.onclick = () => go({ type: 'playlist', id: p.id, name: p.name, source: p.source });
     b.onpointerdown = e => folderDrag(e, b);
+    if (state.pulse === p.id) b.classList.add('got');  // songs were just dropped in
     box.append(b);
   }
+  state.pulse = null;
   setActive();
 }
 // Drag a folder up or down in the sidebar to put the folders in any order.
@@ -800,6 +934,27 @@ $('npA').onclick = () => {
   go({ type: 'artist', name: a });
 };
 
+// ----------------------------------------------- sources: YouTube / Spotify / Local
+// Everything lives in one library; a small badge says where a song came
+// from, and the filter chips narrow Home and the lists to one source.
+const SOURCES = [['all', 'All'], ['youtube', 'YouTube'], ['spotify', 'Spotify'], ['local', 'Local'], ['video', 'Videos']];
+const SRC_BADGE = { youtube: ['yt', 'YT'], spotify: ['sp', 'SP'], upload: ['local', 'LOCAL'], remix: ['remix', 'REMIX'], ai: ['ai', 'AI'] };
+const srcMatch = (t, f) => f === 'all' || (f === 'video' ? t.kind === 'video' : f === 'local' ? ['upload', 'remix', 'ai'].includes(t.source) : t.source === f);
+function srcBadge(t) { const b = SRC_BADGE[t.source]; return b ? el('span', 'src ' + b[0], b[1]) : null; }
+function srcChips(redraw) {
+  const bar = el('div', 'chips');
+  for (const [v, label] of SOURCES) {
+    const b = el('button', 'chip' + (prefs.src === v ? ' sel' : ''), label);
+    b.onclick = () => {
+      prefs.src = v; save('prefs', prefs);
+      [...bar.children].forEach(c => c.classList.toggle('sel', c === b));
+      redraw();
+    };
+    bar.append(b);
+  }
+  return bar;
+}
+
 // ------------------------------------------------------------------ home
 const sectionHead = (title, more) => {
   const h = el('div', 'sec-h'); h.append(el('h2', null, title));
@@ -807,72 +962,96 @@ const sectionHead = (title, more) => {
   return h;
 };
 function trackTile(t, list) {
-  const c = el('button', 'card'), img = el('img', 'tile');
+  const c = el('button', 'card'), img = el('img', 'tile'), badge = srcBadge(t);
   img.loading = 'lazy'; img.alt = ''; setImg(img, t);
   c.append(img, el('b', null, t.title), el('small', null, t.artist || ' '));
+  if (badge) c.append(badge);
   c.onclick = () => { state.queue = list.slice(); playIndex(list.indexOf(t)); };
   c.oncontextmenu = e => { e.preventDefault(); trackMenu(t, at(e)); };
+  c._track = t;  // lets the card be dragged onto a folder
+  return c;
+}
+// A wide 16:9 card for the video row; opens the song with its picture.
+function videoTile(t, list) {
+  const c = el('button', 'card wide'), thumb = el('div', 'thumb'), img = el('img');
+  img.loading = 'lazy'; img.alt = ''; setImg(img, t);
+  thumb.append(img, el('span', 'dur', t.duration ? fmt(t.duration) : ''));
+  thumb.insertAdjacentHTML('beforeend', `<i class="play-ico">${svg('play')}</i>`);
+  c.append(thumb, el('b', null, t.title), el('small', null, t.artist || ' '));
+  c.onclick = () => {
+    prefs.avMode = 'video'; save('prefs', prefs);
+    state.queue = list.slice(); playIndex(list.indexOf(t));
+    openNp();
+  };
+  c.oncontextmenu = e => { e.preventDefault(); trackMenu(t, at(e)); };
+  c._track = t;
   return c;
 }
 async function renderHome() {
-  const view = state.view, main = $('main');
-  main.replaceChildren(hero('Welcome back', 'Home', 'home'));
+  const view = state.view, main = $('main'), hour = new Date().getHours();
+  main.replaceChildren(hero('Home', hour < 5 ? 'Late night' : hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening', 'home'));
   state.shown = [];
   let all, recent, top;
   try { [all, recent, top] = await Promise.all([api('/api/tracks'), api('/api/tracks?view=recent'), api('/api/tracks?view=top'), loadPlaylists()]); }
   catch (e) { if (state.view === view) main.append(el('div', 'empty', e.message)); return; }
   state.home = { all };
   if (state.view !== view) return;
-  $('heroSub').textContent = `${all.length} song${all.length === 1 ? '' : 's'} in your library`;
+  const videos = all.filter(t => t.kind === 'video').length;
+  $('heroSub').textContent = `${all.length} song${all.length === 1 ? '' : 's'}${videos ? ` · ${videos} with video` : ''} from YouTube, Spotify and your own files`;
   if (!all.length) return main.append(el('div', 'empty', LISTS.library.empty));
-  const ready = l => l.filter(t => t.status === 'ready');
-  const section = (title, list, more) => {
-    if (!list.length) return;
-    const grid = el('div', 'grid');
-    list.forEach(t => grid.append(trackTile(t, list)));
-    main.append(sectionHead(title, more), grid);
-  };
-  section('Jump back in', ready(recent).slice(0, 6), { type: 'recent' });
-  section('Recently added', ready(all).slice(0, 12), { type: 'library' });
-  section('Most played', ready(top).slice(0, 6), { type: 'top' });
-  const byArtist = new Map();
-  for (const t of all) for (const a of artistsOf(t)) {
-    const k = a.toLowerCase(), c = byArtist.get(k) || { name: a, n: 0, t };
-    c.n++; byArtist.set(k, c);
-  }
-  const artists = [...byArtist.values()].sort((a, b) => b.n - a.n).slice(0, 12);
-  if (artists.length) {
-    const grid = el('div', 'grid');
-    for (const a of artists) {
+  const body = el('div');
+  const draw = () => {
+    body.replaceChildren();
+    const pick = l => l.filter(t => t.status === 'ready' && srcMatch(t, prefs.src));
+    const shelf = (title, cards, more) => {
+      if (!cards.length) return;
+      const row = el('div', 'shelf'); row.append(...cards);
+      body.append(sectionHead(title, more), row);
+    };
+    const tiles = l => l.map(t => trackTile(t, l));
+    shelf('Jump back in', tiles(pick(recent).slice(0, 12)), { type: 'recent' });
+    const vids = pick(all).filter(t => t.kind === 'video').slice(0, 12);
+    shelf('Videos', vids.map(t => videoTile(t, vids)));
+    shelf('Recently added', tiles(pick(all).slice(0, 16)), { type: 'library' });
+    shelf('Most played', tiles(pick(top).slice(0, 12)), { type: 'top' });
+    const byArtist = new Map();
+    for (const t of pick(all)) for (const a of artistsOf(t)) {
+      const k = a.toLowerCase(), c = byArtist.get(k) || { name: a, n: 0, t };
+      c.n++; byArtist.set(k, c);
+    }
+    shelf('Your artists', [...byArtist.values()].sort((a, b) => b.n - a.n).slice(0, 14).map(a => {
       const c = el('button', 'card artist'), img = el('img', 'tile');
       img.loading = 'lazy'; img.alt = '';
       img.onerror = () => setImg(img, a.t);  // no artist photo found: use a cover of theirs
       img.src = '/api/artist/picture?name=' + encodeURIComponent(a.name);
       c.append(img, el('b', null, a.name), el('small', null, `${a.n} song${a.n === 1 ? '' : 's'}`));
       c.onclick = () => go({ type: 'artist', name: a.name });
-      grid.append(c);
-    }
-    main.append(sectionHead('Your artists'), grid);
-  }
-  if (state.playlists.length) {
-    const grid = el('div', 'grid');
-    for (const p of state.playlists) {
+      return c;
+    }));
+    if (prefs.src === 'all') shelf('Folders', state.playlists.map(p => {
       const c = el('button', 'card'), t = el('div', 'tile');
       t.style.background = grad(p.name); t.innerHTML = svg(p.source === 'folder' ? 'folder' : 'music');
       c.append(t, el('b', null, p.name), el('small', null, `${p.count} track${p.count === 1 ? '' : 's'}`));
       c.onclick = () => go({ type: 'playlist', id: p.id, name: p.name, source: p.source });
-      grid.append(c);
-    }
-    main.append(sectionHead('Folders', { type: 'folders' }), grid);
-  }
+      return c;
+    }), { type: 'folders' });
+    if (!body.children.length) body.append(el('div', 'empty', 'Nothing from this source yet.'));
+  };
+  main.append(srcChips(draw), body);
+  draw();
 }
 
-// The AI jobs that are waiting or running, shown on the Remix tab.
+// The AI jobs that are waiting or running, shown at the top of the studio.
+const JOB_WORD = { song: 'Creating', cover: 'Covering', repaint: 'Re-making part of', split: 'Splitting', mashup: 'Mixing', generate: 'Creating' };
 function paintAi() {
-  const box = $('aiJobs');
-  if (box) box.textContent = (state.ai || []).map(j => `${j.state === 'working' ? 'Working on' : 'Waiting:'} ${j.kind === 'split' ? 'splitting' : 'creating'} “${j.label}”`).join(' · ');
+  const box = $('stJobs');
+  if (!box) return;
+  box.replaceChildren(...(state.ai || []).map(j => {
+    const row = el('div', 'st-job ' + j.state);
+    row.append(el('i', 'spin'), el('span', null, `${j.state === 'working' ? JOB_WORD[j.kind] || 'Working on' : 'Waiting:'} “${j.label}”`));
+    return row;
+  }));
 }
-// Called after every status poll: shows each downloading row's progress.
 function paintDownloads() {
   for (const d of state.downloads || []) $$(`#main .row[data-key="${d.id}"] .tag`).forEach(s => { s.textContent = dlText(d); });
 }
@@ -902,19 +1081,105 @@ function resetRemix() {
   applyRemix();
   if (state.view.type === 'remix' && paintRemix) paintRemix();
 }
+// The Remix page is a small studio with four parts:
+//   Create     a new song from a style and lyrics (song engine)
+//   Effects    change the playing song live and save the result
+//   AI tools   cover, re-make a part, split vocals, mashup, quick beat
+//   Creations  everything made here
+const STYLE_IDEAS = ['Phonk', 'Arabic pop', 'Turkish pop', 'Trap', 'Drill', 'Lo-fi', 'EDM', 'Rock', 'Dabke', 'R&B', 'Synthwave', 'Piano ballad', 'Female vocals', 'Male vocals', 'Heavy bass', 'Slow and emotional', 'Fast and energetic'];
+const LYRIC_TAGS = ['[Intro]', '[Verse]', '[Pre-Chorus]', '[Chorus]', '[Bridge]', '[Outro]'];
+const SING_LANGS = [['', 'Let the song decide'], ['en', 'English'], ['ar', 'Arabic'], ['tr', 'Turkish'], ['es', 'Spanish'], ['fr', 'French'], ['de', 'German'], ['hi', 'Hindi'], ['ko', 'Korean'], ['ja', 'Japanese'], ['pt', 'Portuguese'], ['ru', 'Russian'], ['it', 'Italian']];
+const clock = v => { const p = String(v).trim().split(':').map(Number); return !String(v).trim() || p.some(isNaN) ? NaN : p.reduce((a, b) => a * 60 + b, 0); };
 async function renderRemix() {
   const view = state.view, main = $('main');
   main.replaceChildren(hero('Studio', 'Remix', 'tune'));
-  $('heroSub').textContent = 'Change a song and hear it live, then save the result as a new song. The original stays as it is.';
+  $('heroSub').textContent = 'Make new songs, change the ones you have, and mix them together.';
   state.shown = [];
   let all = [];
   try { all = await api('/api/tracks'); } catch (e) { toast(e.message, 'error'); }
   if (state.view !== view) return;
   const songs = all.filter(t => t.status === 'ready');
-  const wrap = el('div', 'set remix');
-  wrap.innerHTML = `
+  const songSelect = (first, id) => {
+    const s = el('select'); if (id) s.id = id;
+    s.append(new Option(first, ''));
+    for (const t of songs) s.append(new Option(t.title + (t.artist ? ' — ' + t.artist : ''), t.id));
+    return s;
+  };
+  const tabs = el('div', 'seg studio-tabs'), jobs = el('div', 'st-jobs'), pages = {};
+  jobs.id = 'stJobs';
+  for (const [id, label, icon] of [['create', 'Create', 'plus'], ['effects', 'Effects', 'tune'], ['tools', 'AI tools', 'music'], ['made', 'Creations', 'folder']]) {
+    const b = el('button'); b.dataset.tab = id; b.innerHTML = svg(icon); b.append(el('span', null, label));
+    tabs.append(b);
+    pages[id] = el('div', 'set remix'); pages[id].hidden = true;
+  }
+  main.append(tabs, jobs, ...Object.values(pages));
+  const drawMade = async () => {
+    const box = pages.made;
+    let list = all;
+    try { list = all = await api('/api/tracks'); } catch {}
+    if (state.view !== view) return;
+    list = list.filter(t => t.source === 'ai' || t.source === 'remix');
+    box.replaceChildren();
+    state.shown = list;
+    if (!list.length) return box.append(el('div', 'empty', 'Nothing made yet. Songs you create, remix, cover, split or mash up appear here.'));
+    list.forEach((t, i) => box.append(trackRow(t, i)));
+    paintPicked();
+  };
+  const show = id => {
+    prefs.studio = id; save('prefs', prefs);
+    [...tabs.children].forEach(b => b.classList.toggle('sel', b.dataset.tab === id));
+    for (const k in pages) pages[k].hidden = k !== id;
+    state.shown = [];
+    if (id === 'made') drawMade();
+  };
+  tabs.onclick = e => { const b = e.target.closest('button'); if (b) show(b.dataset.tab); };
+  state.studioRefresh = () => { if (state.view === view && prefs.studio === 'made') drawMade(); };
+
+  // ---- Create: a new song from a style and lyrics
+  pages.create.innerHTML = `
+  <div class="box"><h3>New song</h3>
+    <div class="field col"><label for="sgStyle">Style of music</label><textarea id="sgStyle" rows="2" placeholder="For example: Arabic pop, emotional male vocals, oud and strings, 95 bpm"></textarea><div class="st-chips" id="sgIdeas"></div></div>
+    <div class="field"><div><b>Instrumental</b><small>Music only, no singing</small></div>${sw('sgInst')}</div>
+    <div class="field col" id="sgLyricsBox"><label for="sgLyrics">Lyrics</label><textarea id="sgLyrics" rows="9" placeholder="[Verse]&#10;Write the words here, in any language&#10;&#10;[Chorus]&#10;The part that repeats"></textarea><div class="st-chips" id="sgTags"></div><small>The words are sung as you write them. Tags like [Verse] and [Chorus] shape the song.</small></div>
+    <div class="field"><div><label for="sgTitle">Title</label></div><input type="text" id="sgTitle" placeholder="Name of the song" autocomplete="off"></div>
+    <div class="field"><div><b>Length</b><small id="sgLenL"></small></div><input type="range" id="sgLen" min="30" max="300" step="10" value="120"></div>
+  </div>
+  <div class="box"><h3>More options</h3>
+    <div class="field"><div><label for="sgLang">Language of the singing</label></div><select id="sgLang"></select></div>
+    <div class="field"><div><label for="sgBpm">Tempo</label><small>Beats per minute; empty lets the style decide</small></div><input type="text" id="sgBpm" inputmode="numeric" placeholder="auto" autocomplete="off"></div>
+    <div class="field"><div><label for="sgKey">Key</label><small>For example A minor; empty lets the style decide</small></div><input type="text" id="sgKey" placeholder="auto" autocomplete="off"></div>
+  </div>
+  <div class="st-go"><small class="st-state" data-need="songs"></small><button class="btn" id="sgGo" data-need="songs" disabled>Create song</button></div>`;
+  for (const idea of STYLE_IDEAS) {
+    const b = el('button', 'chip', idea);
+    b.onclick = () => { const s = $('sgStyle'), v = s.value.trim(); s.value = v ? v.replace(/,\s*$/, '') + ', ' + idea.toLowerCase() : idea; };
+    $('sgIdeas').append(b);
+  }
+  for (const tag of LYRIC_TAGS) {
+    const b = el('button', 'chip', tag);
+    b.onclick = () => { const s = $('sgLyrics'), at = s.selectionStart ?? s.value.length, lead = at && s.value[at - 1] !== '\n' ? '\n' : ''; s.setRangeText(lead + tag + '\n', at, s.selectionEnd ?? at, 'end'); s.focus(); };
+    $('sgTags').append(b);
+  }
+  for (const [v, l] of SING_LANGS) $('sgLang').append(new Option(l, v));
+  const lenLabel = () => { const v = +$('sgLen').value; $('sgLenL').textContent = `${Math.floor(v / 60)}:${String(v % 60).padStart(2, '0')}`; fill($('sgLen')); };
+  $('sgLen').oninput = lenLabel; lenLabel();
+  $('sgInst').onchange = e => { $('sgLyricsBox').hidden = e.target.checked; };
+  $('sgGo').onclick = async () => {
+    const style = $('sgStyle').value.trim(), inst = $('sgInst').checked, lyrics = inst ? '' : $('sgLyrics').value.trim();
+    if (!style) return toast('Describe the style of music first');
+    if (!inst && !lyrics) return toast('Write some lyrics, or switch on Instrumental');
+    const bpm = parseInt($('sgBpm').value, 10);
+    try {
+      await post('/api/studio/song', { title: $('sgTitle').value.trim(), style, lyrics, duration: +$('sgLen').value, bpm: bpm || null, key: $('sgKey').value.trim(), language: $('sgLang').value });
+      state.wasPending = true;
+      toast('Creating your song — it appears under Creations when it is done');
+    } catch (e) { toast(e.message, 'error', 9000); }
+  };
+
+  // ---- Effects: change the playing song live, then save the result
+  pages.effects.innerHTML = `
   <div class="box"><h3>Song</h3>
-    <div class="field"><div><b id="rxNow"></b><small>Pick the song to remix. It starts playing so you can hear every change.</small></div><select id="rxSong"></select></div>
+    <div class="field"><div><b id="rxNow"></b><small>Pick the song to change. It starts playing so you can hear every change.</small></div></div>
   </div>
   <div class="box"><h3>Style</h3>
     <div class="field"><div class="rx-presets" id="rxPresets"></div></div>
@@ -926,53 +1191,21 @@ async function renderRemix() {
   <div class="box"><h3>Save</h3>
     <div class="field"><div><label for="rxName">Name of the new song</label></div><input type="text" id="rxName" autocomplete="off"></div>
     <div class="field"><div><small>Saved as a new song in your library. Synced lyrics are re-timed to the new speed.</small></div><button class="btn" id="rxSave">Save as new song</button></div>
-  </div>
-  <div class="box"><h3>AI tools</h3>
-    <div class="field"><div><b>Status</b><small id="aiState">Checking…</small><small id="aiJobs"></small></div></div>
-    <div class="field"><div><b>Split vocals and music</b><small>Makes two new songs from the chosen one: an instrumental and a vocals-only version</small></div><button class="btn ghost" id="aiSplit" disabled>Split with AI</button></div>
-    <div class="field"><div><label for="aiPrompt">Create music from a description</label><small>An instrumental clip, for example “dark phonk beat with heavy cowbell, 140 bpm”</small></div><input type="text" id="aiPrompt" placeholder="Describe the music" autocomplete="off"></div>
-    <div class="field"><div><b>Length</b><small id="aiLenL"></small></div><input type="range" id="aiLen" min="5" max="30" step="1" value="20"></div>
-    <div class="field"><div></div><button class="btn ghost" id="aiGen" disabled>Create with AI</button></div>
   </div>`;
-  main.append(wrap);
-  // AI add-on: an optional second container on the server
-  const lenLabel = () => { $('aiLenL').textContent = $('aiLen').value + ' seconds'; fill($('aiLen')); };
-  $('aiLen').oninput = lenLabel; lenLabel();
-  api('/api/ai').then(a => {
-    if (!$('aiState')) return;
-    $('aiState').textContent = a.available
-      ? `Ready on ${a.gpu || a.device}${a.vram_mb ? ` (${Math.round(a.vram_mb / 1024)} GB)` : ''}`
-      : 'The AI add-on is not running. Start it on the server with: docker compose --profile ai up -d --build';
-    $('aiSplit').disabled = $('aiGen').disabled = !a.available;
-    state.ai = a.jobs; paintAi();
-  }).catch(() => {});
-  $('aiSplit').onclick = async () => {
-    const t = song();
-    if (!t) return toast('Pick a song from your library first');
-    try { await post('/api/ai/split', { track_id: t.id }); state.wasPending = true; toast(`Splitting “${t.title}” — the two new songs appear in your library when it is done`); }
-    catch (e) { toast(e.message, 'error', 9000); }
-  };
-  $('aiGen').onclick = async () => {
-    const prompt = $('aiPrompt').value.trim();
-    if (!prompt) return toast('Describe the music first');
-    try { await post('/api/ai/generate', { prompt, seconds: +$('aiLen').value }); state.wasPending = true; toast('Creating your music — it appears in your library when it is done'); }
-    catch (e) { toast(e.message, 'error', 9000); }
-  };
-  const sel = $('rxSong');
-  sel.append(new Option('Choose a song…', ''));
-  for (const t of songs) sel.append(new Option(t.title + (t.artist ? ' — ' + t.artist : ''), t.id));
+  const sel = songSelect('Choose a song…', 'rxSong');
+  $('rxNow').closest('.field').append(sel);
   sel.onchange = () => { const t = songs.find(x => x.id === +sel.value); if (t) { state.queue = [t]; playIndex(0); } };
-  for (const [name, v] of REMIX_PRESETS) {
-    const b = el('button', 'chip', name);
-    b.onclick = () => change(() => Object.assign(remix, v));
-    $('rxPresets').append(b);
-  }
   const song = () => { const t = current(); return t && t.id ? t : null; };
   // every control goes through here: apply, then redraw the controls
   const change = fn => {
     if (!song()) return toast('Pick a song from your library first');
     fn(); applyRemix(); paintRemix();
   };
+  for (const [name, v] of REMIX_PRESETS) {
+    const b = el('button', 'chip', name);
+    b.onclick = () => change(() => Object.assign(remix, v));
+    $('rxPresets').append(b);
+  }
   $('rxSpeed').oninput = e => change(() => { remix.speed = +e.target.value; });
   $('rxBass').oninput = e => change(() => { remix.bass = +e.target.value; });
   $('rxRev').oninput = e => change(() => { remix.reverb = +e.target.value; });
@@ -1005,6 +1238,99 @@ async function renderRemix() {
     if (!remixNamed) $('rxName').value = t ? `${t.title} (${remixLabel()})` : '';
   };
   paintRemix();
+
+  // ---- AI tools
+  pages.tools.innerHTML = `
+  <div class="box"><h3>Cover</h3>
+    <div class="field"><div><b>The same song in another style</b><small>Keeps the tune and words of a song and performs it in the style you describe</small></div><span id="cvSongAt"></span></div>
+    <div class="field col"><label for="cvStyle">New style</label><textarea id="cvStyle" rows="2" placeholder="For example: slow piano ballad, soft female vocals"></textarea></div>
+    <div class="field"><div><b>How close to the original</b><small id="cvStrL"></small></div><input type="range" id="cvStr" min="0.2" max="1" step="0.1" value="0.6"></div>
+    <div class="st-go"><small class="st-state" data-need="songs"></small><button class="btn ghost" id="cvGo" data-need="songs" disabled>Make cover</button></div>
+  </div>
+  <div class="box"><h3>Re-make a part</h3>
+    <div class="field"><div><b>Change one stretch of a song</b><small>Only the time range you give is made again; the rest stays</small></div><span id="rpSongAt"></span></div>
+    <div class="field"><div><label for="rpFrom">From</label><small>Minutes:seconds, for example 0:45</small></div><input type="text" id="rpFrom" placeholder="0:45" autocomplete="off"></div>
+    <div class="field"><div><label for="rpTo">To</label></div><input type="text" id="rpTo" placeholder="1:10" autocomplete="off"></div>
+    <div class="field col"><label for="rpStyle">Style of that part</label><textarea id="rpStyle" rows="2" placeholder="For example: energetic drop with heavy bass"></textarea></div>
+    <div class="field col"><label for="rpLyrics">Words for that part (optional)</label><textarea id="rpLyrics" rows="3"></textarea></div>
+    <div class="st-go"><small class="st-state" data-need="songs"></small><button class="btn ghost" id="rpGo" data-need="songs" disabled>Re-make it</button></div>
+  </div>
+  <div class="box"><h3>Split vocals and music</h3>
+    <div class="field"><div><b>Instrumental and vocals-only</b><small>Makes two new songs from the one you pick</small></div><span id="spSongAt"></span></div>
+    <div class="st-go"><small class="st-state" data-need="available"></small><button class="btn ghost" id="aiSplit" data-need="available" disabled>Split</button></div>
+  </div>
+  <div class="box"><h3>Mashup</h3>
+    <div class="field"><div><b>Combine songs</b><small>The music of one song with the singing of others on top, matched in tempo and key and lined up on the beat</small></div></div>
+    <div class="field"><div><label>Music from</label></div><span id="mxBaseAt"></span></div>
+    <div class="field"><div><label>Vocals from</label><small>Up to three songs; with more than one they take turns through the track</small></div><div class="mx-list" id="mxVoc"></div></div>
+    <div class="field"><div><label for="mxName">Name</label></div><input type="text" id="mxName" placeholder="Leave empty to name it after the songs" autocomplete="off"></div>
+    <div class="st-go"><small class="st-state" data-need="available"></small><button class="btn ghost" id="mxAdd">Add another voice</button><button class="btn ghost" id="mxGo" data-need="available" disabled>Create mashup</button></div>
+  </div>
+  <div class="box"><h3>Quick beat</h3>
+    <div class="field col"><label for="aiPrompt">A short instrumental from a description</label><textarea id="aiPrompt" rows="2" placeholder="For example: dark phonk beat with heavy cowbell, 140 bpm"></textarea></div>
+    <div class="field"><div><b>Length</b><small id="aiLenL"></small></div><input type="range" id="aiLen" min="5" max="30" step="1" value="20"></div>
+    <div class="st-go"><small class="st-state" data-need="available"></small><button class="btn ghost" id="aiGen" data-need="available" disabled>Create beat</button></div>
+  </div>`;
+  const cvSong = songSelect('Choose a song…'), rpSong = songSelect('Choose a song…'), spSong = songSelect('Choose a song…'), mxBase = songSelect('Choose the song for the music…');
+  $('cvSongAt').replaceWith(cvSong); $('rpSongAt').replaceWith(rpSong); $('spSongAt').replaceWith(spSong); $('mxBaseAt').replaceWith(mxBase);
+  const sent = text => { state.wasPending = true; toast(text + ' — it appears under Creations when it is done'); };
+  const strLabel = () => { const v = +$('cvStr').value; $('cvStrL').textContent = v >= 0.9 ? 'Very close' : v >= 0.6 ? 'Recognisable, new style' : v >= 0.4 ? 'Loose' : 'Only the feel'; fill($('cvStr')); };
+  $('cvStr').oninput = strLabel; strLabel();
+  $('cvGo').onclick = async () => {
+    const id = +cvSong.value, style = $('cvStyle').value.trim();
+    if (!id || !style) return toast('Choose a song and describe the new style');
+    try { await post('/api/studio/cover', { track_id: id, style, strength: +$('cvStr').value }); sent('Making the cover'); }
+    catch (e) { toast(e.message, 'error', 9000); }
+  };
+  $('rpGo').onclick = async () => {
+    const id = +rpSong.value, from = clock($('rpFrom').value), to = clock($('rpTo').value), style = $('rpStyle').value.trim();
+    if (!id) return toast('Choose a song first');
+    if (isNaN(from) || isNaN(to) || to <= from) return toast('Give the part as times, for example from 0:45 to 1:10');
+    if (!style) return toast('Describe the style of that part');
+    try { await post('/api/studio/repaint', { track_id: id, start: from, end: to, style, lyrics: $('rpLyrics').value.trim() }); sent('Re-making that part'); }
+    catch (e) { toast(e.message, 'error', 9000); }
+  };
+  $('aiSplit').onclick = async () => {
+    const id = +spSong.value;
+    if (!id) return toast('Choose a song first');
+    try { await post('/api/ai/split', { track_id: id }); sent('Splitting the song'); }
+    catch (e) { toast(e.message, 'error', 9000); }
+  };
+  const addVoice = () => { if ($('mxVoc').children.length < 3) $('mxVoc').append(songSelect('Choose a song for the vocals…')); $('mxAdd').hidden = $('mxVoc').children.length >= 3; };
+  addVoice();
+  $('mxAdd').onclick = addVoice;
+  $('mxGo').onclick = async () => {
+    const base = +mxBase.value, voices = [...$('mxVoc').children].map(s => +s.value).filter(Boolean);
+    if (!base || !voices.length) return toast('Choose a song for the music and at least one for the vocals');
+    if (new Set([base, ...voices]).size !== voices.length + 1) return toast('Choose different songs');
+    try { await post('/api/ai/mashup', { base_id: base, vocal_ids: voices, name: $('mxName').value.trim() }); sent('Mixing your mashup'); }
+    catch (e) { toast(e.message, 'error', 9000); }
+  };
+  const beatLabel = () => { $('aiLenL').textContent = $('aiLen').value + ' seconds'; fill($('aiLen')); };
+  $('aiLen').oninput = beatLabel; beatLabel();
+  $('aiGen').onclick = async () => {
+    const prompt = $('aiPrompt').value.trim();
+    if (!prompt) return toast('Describe the beat first');
+    try { await post('/api/ai/generate', { prompt, seconds: +$('aiLen').value }); sent('Creating your beat'); }
+    catch (e) { toast(e.message, 'error', 9000); }
+  };
+
+  show(pages[prefs.studio] ? prefs.studio : 'create');
+  paintAi();
+  // which AI parts are running on the server decides which buttons work
+  api('/api/ai').then(a => {
+    if (state.view !== view) return;
+    const start = 'Start it on the server with: docker compose --profile ai up -d --build';
+    const text = {
+      songs: a.songs ? '' : 'The song engine is not running. ' + start,
+      available: a.available ? '' : 'The AI add-on is not running. ' + start,
+    };
+    main.querySelectorAll('[data-need]').forEach(n => {
+      if (n.tagName === 'BUTTON') n.disabled = !a[n.dataset.need];
+      else n.textContent = text[n.dataset.need];
+    });
+    state.ai = a.jobs; paintAi();
+  }).catch(() => {});
 }
 
 // ------------------------------------------------------- spotify preview
@@ -1066,57 +1392,97 @@ $('form').onsubmit = async e => {
     } catch (err) { toast(err.message, 'error'); }
     return;
   }
-  // The search and its results are kept, so the Search tab can be left and
-  // come back to without searching again.
-  const s = state.search = { q, res: null, error: null };
+  // One search for everything: the library, YouTube and Spotify are asked at
+  // the same time and each group fills in when its answer arrives. The
+  // results are kept, so the Search tab can be left and come back to.
+  const s = state.search = { q, lib: null, yt: null, sp: null, ytError: null, spError: null, spOff: false };
   go({ type: 'search' });
-  try { s.res = await api('/api/search?q=' + encodeURIComponent(q)); s.res.forEach(t => { t.status = 'ready'; t.stream = true; }); }
-  catch (err) { s.error = err.message; }
-  if (state.search === s && state.view.type === 'search') renderSearch();
+  const enc = encodeURIComponent(q);
+  const done = () => { if (state.search === s && state.view.type === 'search') renderSearch(); };
+  api('/api/library/search?q=' + enc).then(r => { s.lib = r; }, () => { s.lib = []; }).then(done);
+  api('/api/search?q=' + enc).then(r => {
+    r.forEach(t => { t.status = 'ready'; t.stream = true; t.source = 'youtube'; });
+    s.yt = r;
+  }, err => { s.yt = []; s.ytError = err.message; }).then(done);
+  api('/api/spotify/search?q=' + enc).then(r => {
+    s.spOff = !r.available;
+    // a Spotify song has no video yet; it is matched on YouTube when played
+    s.sp = r.tracks.map(t => ({ key: 'sp:' + t.id, sp_id: t.id, title: t.title, artist: t.artist, duration: t.duration, cover: t.cover, in_library: t.in_library, status: 'ready', stream: true, source: 'spotify' }));
+  }, err => { s.sp = []; s.spError = err.message; }).then(done);
 };
 function renderSearch() {
   const s = state.search, main = $('main');
-  main.replaceChildren(hero('YouTube search', s ? s.q : 'Search', 'search'));
-  const box = el('div'); main.append(box);
+  main.replaceChildren(hero('Search', s ? s.q : 'Search', 'search'));
   state.shown = [];
-  if (!s) return box.append(el('div', 'empty', 'Type in the box at the top to search YouTube. Your results stay here while you look around.'));
-  if (s.error) return box.append(el('div', 'empty', 'Search failed: ' + s.error));
-  if (!s.res) return box.append(el('div', 'empty', 'Searching YouTube…'));
-  const res = s.res;
-  {
-    $('heroSub').textContent = `${res.length} results — tap one to listen or watch without downloading, ⬇ to keep it, or drag it onto a folder`;
-    box.replaceChildren();
-    if (!res.length) box.append(el('div', 'empty', 'No results.'));
-    res.forEach(t => { t.status = 'ready'; t.stream = true; });
-    state.shown = res;
-    const cur = current();
-    res.forEach((t, i) => {
-      const row = el('div', 'row playable'); row.style.animationDelay = i * 18 + 'ms';
-      row.dataset.key = tkey(t);
-      row.oncontextmenu = e => { e.preventDefault(); trackMenu(t, at(e)); };
-      if (cur && tkey(cur) === tkey(t)) row.classList.add('current');
-      row.onclick = () => askKind(row, t.title, ['Listen (audio only)', 'Watch video'], kind => {
-        state.queue = res.map(x => ({ ...x, kind }));
-        playIndex(res.indexOf(t));
-      });
-      const img = el('img'); img.loading = 'lazy'; img.alt = ''; setImg(img, t);
-      const meta = el('div'); meta.append(el('div', 't', t.title), el('div', 'a', t.artist));
-      const b = el('button', 'chip', t.in_library ? '✓ Added' : '⬇ Download');
-      if (t.in_library) b.title = 'Show it in your library';
-      b.onclick = e => { e.stopPropagation(); t.in_library ? locate(t) : saveStream(t); };
-      row.append(el('div', 'n', i + 1), img, meta, el('div'), el('div', 'd', t.duration ? fmt(t.duration) : ''), el('div'));
-      row.children[3].append(b);
-      box.append(row);
-    });
-  }
+  if (!s) return main.append(el('div', 'empty', 'Type in the box at the top to search your library, YouTube and Spotify at once. Your results stay here while you look around.'));
+  $('heroSub').textContent = 'Your library, YouTube and Spotify at once — tap to play, ⬇ to keep, or drag onto a folder';
+  const note = text => el('div', 'snote', text);
+  const group = (title, cls) => {
+    const h = sectionHead(title), box = el('div');
+    h.querySelector('h2').prepend(el('span', 'dot ' + cls));
+    main.append(h, box);
+    return box;
+  };
+  let n = 0;  // rows are numbered across the three groups
+  const lib = group('In your library', 'local');
+  if (!s.lib) lib.append(note('Searching…'));
+  else if (!s.lib.length) lib.append(note('Nothing in your library matches.'));
+  else for (const t of s.lib) lib.append(trackRow(t, n++));
+  const yt = group('YouTube', 'yt');
+  if (!s.yt) yt.append(note('Searching YouTube…'));
+  else if (s.ytError) yt.append(note('YouTube search failed: ' + s.ytError));
+  else if (!s.yt.length) yt.append(note('No results.'));
+  else for (const t of s.yt) yt.append(streamRow(t, n++, s.yt));
+  const sp = group('Spotify', 'sp');
+  if (!s.sp) sp.append(note('Searching Spotify…'));
+  else if (s.spError) sp.append(note(s.spError));
+  else if (s.spOff) {
+    const box = note('Searching Spotify needs your free Spotify API keys. Pasting a Spotify link works without them. ');
+    const b = el('button', 'chip', 'Add keys in Settings');
+    b.onclick = () => openSettings('accounts');
+    box.append(b); sp.append(box);
+  } else if (!s.sp.length) sp.append(note('No results.'));
+  else for (const t of s.sp) sp.append(streamRow(t, n++, s.sp));
+  state.shown = [...(s.lib || []), ...(s.yt || []), ...(s.sp || [])];
+  paintPicked();
+}
+// A row for a song that is not downloaded (a YouTube or Spotify result).
+function streamRow(t, i, list) {
+  const row = el('div', 'row playable'), cur = current();
+  row.style.animationDelay = Math.min(i, 12) * 14 + 'ms';
+  row.dataset.key = tkey(t);
+  row.oncontextmenu = e => { e.preventDefault(); trackMenu(t, at(e)); };
+  if (cur && tkey(cur) === tkey(t)) row.classList.add('current');
+  row.onclick = () => askKind(row, t.title, ['Listen (audio only)', 'Watch video'], kind => {
+    state.queue = list.map(x => ({ ...x, kind }));
+    playIndex(list.indexOf(t));
+  });
+  const img = el('img'); img.loading = 'lazy'; img.alt = ''; setImg(img, t);
+  const title = el('div', 't', t.title), badge = srcBadge(t);
+  if (badge) title.append(badge);
+  const meta = el('div'); meta.append(title, el('div', 'a', t.artist));
+  const b = el('button', 'chip', t.in_library ? '✓ Added' : '⬇ Download');
+  if (t.in_library) b.title = 'Show it in your library';
+  b.onclick = e => { e.stopPropagation(); t.in_library ? locate(t) : saveStream(t); };
+  const act = el('div'); act.append(b);
+  row.append(el('div', 'n', i + 1), img, meta, act, el('div', 'd', t.duration ? fmt(t.duration) : ''), el('div'));
+  return row;
 }
 // Open the place a downloaded song is kept (its folder, else the library)
 // and point at it.
 async function locate(t) {
   let w;
-  try { w = await api('/api/where/' + t.video_id); }
-  catch { return toast('That song is not in your library any more', 'error'); }
-  await go(w.playlist ? { type: 'playlist', ...w.playlist } : { type: 'library' });
+  prefs.src = 'all';  // a source filter must not hide the song being shown
+  if (!t.video_id) {  // a Spotify result: find it in the library by name
+    await go({ type: 'library' });
+    const hit = state.tracks.find(x => x.title === t.title && (x.artist || '') === (t.artist || ''));
+    if (!hit) return;
+    w = { id: hit.id };
+  } else {
+    try { w = await api('/api/where/' + t.video_id); }
+    catch { return toast('That song is not in your library any more', 'error'); }
+    await go(w.playlist ? { type: 'playlist', ...w.playlist } : { type: 'library' });
+  }
   const row = document.querySelector(`#main .row[data-key="${w.id}"]`);
   if (!row) return;
   pickAnchor = String(w.id); setPicked([pickAnchor]);
@@ -1179,6 +1545,14 @@ function addToQueue(t) {
 function playIndex(i, autoplay = true, startAt = 0) {
   state.index = i;
   const t = state.queue[i];
+  if (!t.id && !t.video_id && t.sp_id) {  // a Spotify result: find its match on YouTube first
+    $('nowT').textContent = t.title; $('nowA').textContent = 'Finding it on YouTube…';
+    api(`/api/spotify/match?title=${encodeURIComponent(t.title)}&artist=${encodeURIComponent(t.artist || '')}&duration=${t.duration || 0}`).then(r => {
+      t.video_id = r.video_id;
+      if (state.queue[state.index] === t) playIndex(i, autoplay, startAt);
+    }, e => toast('Could not play that song: ' + e.message, 'error'));
+    return;
+  }
   if (!t.id && t.kind === 'video') t.vsrc = true;
   resetRemix();  // a remix preview belongs to the song it was made on
   audio.src = srcOf(t);
@@ -1196,6 +1570,7 @@ function playIndex(i, autoplay = true, startAt = 0) {
   if (isVideo && autoplay && !wide()) openNp();
   setImg($('art'), t); setImg($('npArt'), t);
   $('npBg').style.backgroundImage = `url("${coverUrl(t)}")`;
+  themeFromCover(t);
   document.title = `${t.title} · Homelab Music`;
   if ('mediaSession' in navigator) {
     navigator.mediaSession.metadata = new MediaMetadata({ title: t.title, artist: t.artist || '', artwork: [{ src: coverUrl(t), sizes: '320x180' }] });
@@ -1704,6 +2079,7 @@ async function renderSettings() {
     <div class="field"><div><b>Accent colour</b></div><div class="swatches" id="setAccent"></div></div>
   </div>
   <div class="box" data-cat="appearance"><h3>Layout &amp; effects</h3>
+    <div class="field"><div><b>Colours follow the cover</b><small>The whole player takes its colours from the song that is playing</small></div>${sw('setCover')}</div>
     <div class="field"><div><b>Animated background</b><small>Slow drifting colour glow</small></div>${sw('setAnim')}</div>
     <div class="field"><div><b>Compact rows</b><small>Fit more tracks on screen</small></div>${sw('setCompact')}</div>
     <div class="field"><div><b>Visualizer</b><small>Sound effect shown for audio in Now Playing</small></div><div class="seg" id="setViz"><button data-v="bars">Bars</button><button data-v="circle">Ring</button><button data-v="wave">Wave</button><button data-v="off">Off</button></div></div>
@@ -1752,7 +2128,10 @@ async function renderSettings() {
     <div class="field"><div><label for="pwNew">New password</label><small>At least 4 characters. Other devices are signed out when it changes.</small></div><input type="password" id="pwNew" autocomplete="new-password"></div>
     <div class="field"><div></div><button class="btn ghost" id="pwRemove" hidden>Remove password</button><button class="btn ghost" id="logout" hidden>Log out</button><button class="btn" id="pwSave">Save password</button></div>
   </div>
-  <div class="box" data-cat="library"><h3>Storage</h3><div class="stats" id="stats"></div></div>`;
+  <div class="box" data-cat="library"><h3>Storage</h3><div class="stats" id="stats"></div></div>
+  <div class="box" data-cat="library"><h3>Watched folder</h3>
+    <div class="field"><div><b>Add files by copying them</b><small id="impLbl">Checking…</small></div><button class="btn ghost" id="impScan" disabled>Scan now</button></div>
+  </div>`;
   pane.append(wrap);
   showSetCat(state.setCat || 'appearance');
 
@@ -1768,7 +2147,7 @@ async function renderSettings() {
   custom.oninput = () => { prefs.accent = custom.value; applyPrefs(); paintSw(); };
   sws.append(custom); paintSw();
   const bind = (id, key) => { const c = $(id); c.checked = prefs[key]; c.onchange = () => { prefs[key] = c.checked; applyPrefs(); }; };
-  bind('setAnim', 'anim'); bind('setCompact', 'compact'); bind('setResume', 'resume');
+  bind('setAnim', 'anim'); bind('setCompact', 'compact'); bind('setResume', 'resume'); bind('setCover', 'coverTheme');
   const vz = $('setViz');
   const paintVz = () => vz.querySelectorAll('button').forEach(b => b.classList.toggle('sel', b.dataset.v === prefs.viz));
   vz.onclick = e => { const v = e.target.dataset.v; if (!v) return; prefs.viz = v; applyPrefs(); paintVz(); vizStart(); };
@@ -1822,6 +2201,14 @@ async function renderSettings() {
   $('restoreNames').onclick = async () => { try { const r = await post('/api/restore-names'); toast(r.count ? `Restored ${r.count} name(s)` : 'Nothing to restore'); after(); } catch (e) { toast(e.message, 'error'); } };
   $('retryAll').onclick = async () => { const r = await post('/api/retry-failed'); state.wasPending = true; toast(`Retrying ${r.count} track(s)`); };
   $('lyAll').onclick = async () => { const r = await post('/api/lyrics/all'); toast(r.count ? `Looking up lyrics for ${r.count} track(s) in the background` : 'Every track has already been checked'); };
+  $('impLbl').textContent = s.import_dir
+    ? 'Music and video files put in the “import” folder next to docker-compose.yml join the library within a minute, marked Local. A sub-folder becomes a folder here. Your files are never moved or deleted.'
+    : 'Not set up on this server (the “import” folder is not mounted).';
+  $('impScan').disabled = !s.import_dir;
+  $('impScan').onclick = async () => {
+    try { const r = await post('/api/import/scan'); toast(r.count ? `Added ${r.count} file(s)` : 'Nothing new in the watched folder'); state.tracksKey = ''; if (isList(state.view)) reload(true); }
+    catch (e) { toast(e.message, 'error'); }
+  };
   const st = $('stats');
   for (const [v, l] of [[s.stats.tracks, 'Tracks'], [s.stats.folders, 'Folders'], [s.stats.lyrics, 'With lyrics'], [bytes(s.stats.bytes), 'Storage used']]) { const d = el('div'); d.append(el('b', null, v), el('small', null, l)); st.append(d); }
 }
@@ -1849,13 +2236,39 @@ async function poll() {
     for (const ev of s.events) if (ev.id > state.lastEvent) { state.lastEvent = ev.id; if (!firstPoll) toast(ev.msg, ev.level); }
     state.downloads = (s.downloads || []).filter(d => !gone.has(d.id));
     paintDownloads();
+    const before = (state.ai || []).length;
     state.ai = s.ai || []; paintAi();
+    if (state.ai.length < before && state.studioRefresh) state.studioRefresh();  // a studio job finished
     if (s.pending || state.wasPending) await reload();
     state.wasPending = s.pending > 0;
   } catch {}
   firstPoll = false;
   setTimeout(poll, state.wasPending ? 1000 : 2500);  // faster while something downloads
 }
+
+// --------------------------------------------------------- phone gestures
+// Swipe the mini player up to open the full player and sideways to change
+// song; swipe the full player down to close it, sideways on the cover to skip.
+function onSwipe(target, fn) {
+  let start = null;
+  target.addEventListener('touchstart', e => { start = e.touches.length === 1 ? { x: e.touches[0].clientX, y: e.touches[0].clientY, el: e.target } : null; }, { passive: true });
+  target.addEventListener('touchend', e => {
+    if (!start) return;
+    const p = e.changedTouches[0], s = start;
+    start = null;
+    fn(p.clientX - s.x, p.clientY - s.y, s.el);
+  }, { passive: true });
+}
+onSwipe($('player'), (dx, dy, from) => {
+  if (wide() || from.closest('input')) return;
+  if (dy < -40 && Math.abs(dy) > Math.abs(dx)) openNp();
+  else if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5 && current()) dx < 0 ? next() : prev();
+});
+onSwipe($('np'), (dx, dy, from) => {
+  if (wide() || !npOpen() || from.closest('input, .lyrics, .ly-head')) return;
+  if (dy > 80 && Math.abs(dy) > Math.abs(dx) * 1.5 && $('np').querySelector('.np-body').scrollTop < 5) closeNp();
+  else if (Math.abs(dx) > 70 && Math.abs(dx) > Math.abs(dy) * 1.5 && from.closest('.art-wrap')) dx < 0 ? next() : prev();
+});
 
 // ------------------------------------------------------------------ init
 applyPrefs();

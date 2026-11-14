@@ -28,7 +28,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
-                               RedirectResponse, StreamingResponse)
+                               RedirectResponse, Response, StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
@@ -94,6 +94,8 @@ def init_db():
             PRIMARY KEY(playlist_id, track_id));
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, created REAL);
+        CREATE TABLE IF NOT EXISTS imported(
+            path TEXT PRIMARY KEY, size INTEGER, mtime REAL);
         CREATE TABLE IF NOT EXISTS artists(
             name TEXT PRIMARY KEY, data TEXT, fetched REAL);
         """)
@@ -918,6 +920,7 @@ def startup():
         jobs.put(("track", tid))
     for _ in range(max(1, WORKERS)):
         threading.Thread(target=worker, daemon=True).start()
+    threading.Thread(target=watch_import, daemon=True).start()
 
 
 # ------------------------------------------------------------------ upload
@@ -1019,6 +1022,197 @@ class TrackRef(BaseModel):
 class TrackEdit(BaseModel):
     title: str | None = None
     artist: str | None = None
+
+
+# ---------------------------------------------------------- watched folder
+# Files copied into this folder (a mounted volume) join the library by
+# themselves. They are linked or copied, never moved or deleted, and a
+# sub-folder's name becomes a folder in the player.
+IMPORT_DIR = Path(os.environ.get("IMPORT_DIR", "/import"))
+_scan_lock = threading.Lock()
+
+
+def scan_import() -> int:
+    if not IMPORT_DIR.is_dir():
+        return 0
+    added = 0
+    with _scan_lock:
+        for p in sorted(IMPORT_DIR.rglob("*")):
+            try:
+                if (not p.is_file() or p.name.startswith(".")
+                        or p.suffix.lower() not in AUDIO_EXT):
+                    continue
+                st = p.stat()
+                if time.time() - st.st_mtime < 15:
+                    continue  # probably still being copied
+                rel = p.relative_to(IMPORT_DIR)
+                with db() as con:
+                    seen = con.execute("SELECT size FROM imported WHERE path=?",
+                                       (str(rel),)).fetchone()
+                if seen and seen["size"] == st.st_size:
+                    continue
+                dest = MUSIC / f"up_{uuid.uuid4().hex[:12]}{p.suffix.lower()}"
+                try:
+                    os.link(p, dest)       # no extra disk space when possible
+                except OSError:
+                    shutil.copy2(p, dest)
+                pid = None
+                if len(rel.parts) > 1:     # /import/Rock/song.mp3 -> "Rock"
+                    with db() as con:
+                        row = con.execute(
+                            "SELECT id FROM playlists WHERE name=? AND "
+                            "source='folder'", (rel.parts[0],)).fetchone()
+                        pid = row["id"] if row else con.execute(
+                            "INSERT INTO playlists(name,url,source) "
+                            "VALUES(?,?,?)", (rel.parts[0],
+                                              f"folder:{uuid.uuid4().hex}",
+                                              "folder")).lastrowid
+                try:
+                    save_upload_meta(dest, p.name, pid)
+                    added += 1
+                except HTTPException:
+                    pass  # not playable: remembered below so it is not retried
+                with db() as con:
+                    con.execute("INSERT OR REPLACE INTO imported VALUES(?,?,?)",
+                                (str(rel), st.st_size, st.st_mtime))
+            except OSError:
+                continue
+    if added:
+        notify(f"Added {added} file(s) from the watched folder")
+    return added
+
+
+def watch_import():
+    while True:
+        try:
+            scan_import()
+        except Exception:
+            pass
+        time.sleep(60)
+
+
+@app.post("/api/import/scan")
+def import_scan():
+    if not IMPORT_DIR.is_dir():
+        raise HTTPException(400, "No watched folder is set up on the server")
+    return {"count": scan_import()}
+
+
+@app.get("/api/thumb/{video_id}")
+def thumb(video_id: str):
+    """A YouTube thumbnail served from here, so the page is allowed to read
+    its colours (browsers block that for images from other sites)."""
+    if not re.fullmatch(r"[\w-]{6,20}", video_id):
+        raise HTTPException(400, "Bad video id")
+    try:
+        req = urllib.request.Request(
+            f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg",
+            headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = r.read()
+    except Exception:
+        raise HTTPException(404)
+    return Response(data, media_type="image/jpeg",
+                    headers={"Cache-Control": "max-age=604800"})
+
+
+# ------------------------------------------------------- search everywhere
+def track_cols() -> str:
+    return (",".join("t." + c for c in TRACK_COLS.split(","))
+            + ",t.video_file IS NOT NULL AS vfile")
+
+
+@app.get("/api/library/search")
+def library_search(q: str):
+    q = q.strip()
+    if not q:
+        return []
+    like = "%" + q.replace("%", "").replace("_", " ") + "%"
+    with db() as con:
+        return [dict(r) for r in con.execute(
+            f"SELECT {track_cols()} FROM tracks t WHERE t.title LIKE ? OR "
+            "t.artist LIKE ? ORDER BY t.plays DESC, t.id DESC LIMIT 30",
+            (like, like))]
+
+
+_sp_token = {"value": None, "exp": 0.0}
+
+
+def spotify_token() -> str | None:
+    """An app token for Spotify's catalogue, or None without credentials."""
+    cid, secret = spotify_creds()
+    if not (cid and secret):
+        return None
+    if _sp_token["exp"] < time.time():
+        auth = base64.b64encode(f"{cid}:{secret}".encode()).decode()
+        j = json.loads(http("https://accounts.spotify.com/api/token",
+                            {"Authorization": f"Basic {auth}"},
+                            b"grant_type=client_credentials"))
+        _sp_token.update(value=j["access_token"],
+                         exp=time.time() + int(j.get("expires_in", 3600)) - 60)
+    return _sp_token["value"]
+
+
+@app.get("/api/spotify/search")
+def spotify_search(q: str):
+    """Search Spotify's catalogue (needs the API credentials from Settings)."""
+    try:
+        tok = spotify_token()
+    except Exception as e:
+        raise HTTPException(502, f"Spotify sign-in failed: {clean_err(e)}")
+    if not tok or not q.strip():
+        return {"available": bool(tok), "tracks": []}
+    try:
+        j = json.loads(http(
+            "https://api.spotify.com/v1/search?type=track&limit=12&q="
+            + urllib.parse.quote(q.strip()), {"Authorization": f"Bearer {tok}"}))
+    except Exception as e:
+        raise HTTPException(502, f"Spotify search failed: {clean_err(e)}")
+    with db() as con:
+        have = {r["ext_id"] for r in con.execute(
+            "SELECT ext_id FROM tracks WHERE ext_id LIKE 'sp:%'")}
+    out = []
+    for t in (j.get("tracks") or {}).get("items") or []:
+        imgs = (t.get("album") or {}).get("images") or []
+        out.append({"id": t["id"], "title": t["name"],
+                    "artist": ", ".join(a["name"] for a in t.get("artists", [])),
+                    "duration": int(t.get("duration_ms") or 0) // 1000,
+                    "cover": (imgs[1] if len(imgs) > 1 else imgs[0])["url"]
+                    if imgs else None,
+                    "in_library": f"sp:{t['id']}" in have})
+    return {"available": True, "tracks": out}
+
+
+class SpotifyAdd(BaseModel):
+    id: str
+    title: str
+    artist: str = ""
+    duration: int = 0
+    playlist: int | None = None
+
+
+@app.post("/api/spotify/add")
+def spotify_add(req: SpotifyAdd):
+    """Download one Spotify song (its best match on YouTube)."""
+    if not re.fullmatch(r"[A-Za-z0-9]{10,40}", req.id):
+        raise HTTPException(400, "Bad track id")
+    tid = add_track(f"sp:{req.id}", req.title, req.artist, req.duration,
+                    "spotify")
+    if req.playlist:
+        with db() as con:
+            if con.execute("SELECT 1 FROM playlists WHERE id=?",
+                           (req.playlist,)).fetchone():
+                playlist_append(con, req.playlist, tid)
+    return {"id": tid}
+
+
+@app.get("/api/spotify/match")
+def spotify_match(title: str, artist: str = "", duration: int = 0):
+    """The YouTube video to stream for a Spotify song that is not downloaded."""
+    try:
+        return {"video_id": match_youtube(artist, title, duration)}
+    except Exception as e:
+        raise HTTPException(502, clean_err(e))
 
 
 @app.get("/api/search")
@@ -1247,10 +1441,155 @@ def wav_to_track(wav: Path, title: str, artist: str, source: str,
     return tid
 
 
+# ------------------------------------------------------------ song engine
+# ACE-Step 1.5 in its own container: full songs with vocals from a style and
+# lyrics, covers of an existing song, and replacing part of a song.
+SONG_URL = os.environ.get("SONG_URL", "http://songs:8001").rstrip("/")
+_gpu_lock = threading.Lock()  # one graphics-card job at a time (6 GB cards)
+
+
+def song_call(path: str, body: dict | None = None, timeout: float = 30):
+    req = urllib.request.Request(
+        SONG_URL + path, headers={"Content-Type": "application/json"},
+        data=json.dumps(body).encode() if body is not None else None)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            j = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read()).get("detail")
+        except Exception:
+            detail = None
+        raise RuntimeError(detail or f"The song engine failed ({e.code})")
+    except (urllib.error.URLError, OSError):
+        raise RuntimeError("The song engine is not running")
+    return j.get("data", j) if isinstance(j, dict) else j
+
+
+def song_upload(fields: dict, src: Path):
+    """Submit a job together with a source audio file (cover, re-make)."""
+    boundary = uuid.uuid4().hex
+    parts = []
+    for k, v in fields.items():
+        v = str(v).lower() if isinstance(v, bool) else str(v)
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; '
+                     f'name="{k}"\r\n\r\n{v}\r\n'.encode())
+    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; '
+                 f'name="src_audio"; filename="{src.name}"\r\n'
+                 'Content-Type: audio/wav\r\n\r\n'.encode()
+                 + src.read_bytes() + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    req = urllib.request.Request(
+        SONG_URL + "/release_task", data=b"".join(parts),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            j = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read()).get("detail")
+        except Exception:
+            detail = None
+        raise RuntimeError(detail or f"The song engine failed ({e.code})")
+    except (urllib.error.URLError, OSError):
+        raise RuntimeError("The song engine is not running")
+    return j.get("data", j)
+
+
+def song_make(body: dict, out: Path, src: Path | None = None):
+    """Submit a job to the song engine, wait for it and save the audio."""
+    try:
+        ai_call("/unload", {}, 30)  # free the card for the big model
+    except Exception:
+        pass
+    body = {"inference_steps": 8, "batch_size": 1, "thinking": False,
+            "audio_format": "flac", "use_random_seed": True, **body}
+    task = song_upload(body, src) if src else song_call("/release_task", body)
+    task_id = task["task_id"]
+    deadline = time.time() + 3600
+    while time.time() < deadline:
+        time.sleep(3)
+        res = song_call("/query_result", {"task_id_list": [task_id]})
+        item = next((x for x in res if x.get("task_id") == task_id), None) \
+            if isinstance(res, list) else None
+        if not item or item.get("status") == 0:
+            continue
+        result = item.get("result")
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except ValueError:
+                result = []
+        first = result[0] if isinstance(result, list) and result else {}
+        if item.get("status") != 1 or not first.get("file"):
+            raise RuntimeError("The song engine could not make this song")
+        with urllib.request.urlopen(SONG_URL + first["file"], timeout=600) as r:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(r.read())
+        return
+    raise RuntimeError("The song engine took too long")
+
+
+def song_source(row, tmp: Path) -> str:
+    """A copy of a library song as WAV for the engine to read."""
+    tmp.mkdir(parents=True, exist_ok=True)
+    wav = tmp / "source.wav"
+    r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-i",
+                        str(MUSIC / Path(row["file"]).name), "-vn", "-ar",
+                        "48000", "-ac", "2", str(wav)],
+                       capture_output=True, text=True, timeout=600)
+    if r.returncode or not wav.exists():
+        raise RuntimeError("Could not read that song")
+    return str(wav)
+
+
+def run_song(job: dict, tmp: Path):
+    out = tmp / "song.flac"
+    body = {"prompt": job["style"], "lyrics": job["lyrics"] or "[Instrumental]"}
+    for key in ("audio_duration", "bpm", "key_scale", "vocal_language", "seed"):
+        if job.get(key):
+            body[key] = job[key]
+    if job.get("seed"):
+        body["use_random_seed"] = False
+    row = src = None
+    if job["kind"] in ("cover", "repaint"):
+        with db() as con:
+            row = con.execute("SELECT * FROM tracks WHERE id=? AND "
+                              "status='ready'", (job["track_id"],)).fetchone()
+        if not row or not row["file"]:
+            raise RuntimeError("That song is no longer in the library")
+        src = Path(song_source(row, tmp))
+        body["task_type"] = job["kind"]
+        if job["kind"] == "cover":
+            body["audio_cover_strength"] = job["strength"]
+        else:
+            body.update(repainting_start=job["start"],
+                        repainting_end=job["end"])
+    song_make(body, out, src)
+    tid = wav_to_track(out, job["label"], job.get("artist") or "AI",
+                       "ai" if job["kind"] == "song" else "remix")
+    if row is not None:
+        copy_cover(row, tid)
+    if job["kind"] == "song" and job["lyrics"]:
+        with db() as con:  # the words that were sung, shown as plain lyrics
+            con.execute("UPDATE tracks SET lyrics=?,lyrics_state='plain' "
+                        "WHERE id=?", (job["lyrics"], tid))
+    notify(f"“{job['label']}” is ready in your library")
+
+
 def run_ai(job: dict):
+    with _gpu_lock:
+        _run_ai(job)
+
+
+def _run_ai(job: dict):
     job["state"] = "working"
     tmp = AI_TMP / job["id"]
     try:
+        if job["kind"] in ("song", "cover", "repaint"):
+            run_song(job, tmp)
+            job["state"] = "done"
+            return
         if job["kind"] == "split":
             with db() as con:
                 row = con.execute("SELECT * FROM tracks WHERE id=?",
@@ -1267,6 +1606,24 @@ def run_ai(job: dict):
                          row["artist"], "remix", row)
             notify(f"“{row['title']}” is split: the instrumental and the "
                    "vocals-only song are in your library")
+        elif job["kind"] == "mashup":
+            with db() as con:
+                rows = {r["id"]: r for r in con.execute(
+                    "SELECT * FROM tracks WHERE status='ready' AND file IS "
+                    "NOT NULL")}
+            ids = [job["base_id"], *job["vocal_ids"]]
+            if any(i not in rows for i in ids):
+                raise RuntimeError("One of the songs is no longer in the library")
+            path = lambda i: str(MUSIC / Path(rows[i]["file"]).name)
+            out = tmp / "mashup.wav"
+            ai_call("/mashup", {"base": path(ids[0]),
+                                "vocals": [path(i) for i in ids[1:]],
+                                "out": str(out)}, 3600)
+            artists = list(dict.fromkeys(
+                rows[i]["artist"] for i in ids if rows[i]["artist"]))
+            tid = wav_to_track(out, job["label"], " × ".join(artists), "remix")
+            copy_cover(rows[ids[0]], tid)
+            notify(f"Mashup “{job['label']}” is ready in your library")
         else:
             out = tmp / "music.wav"
             ai_call("/generate", {"prompt": job["prompt"],
@@ -1282,9 +1639,10 @@ def run_ai(job: dict):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def ai_queue(job: dict):
+def ai_queue(job: dict, songs: bool = False):
     try:
-        ai_call("/health", timeout=3)
+        song_call("/health", timeout=3) if songs else ai_call("/health",
+                                                              timeout=3)
     except Exception as e:
         raise HTTPException(503, f"{e}. Start it on the server with: "
                                  "docker compose --profile ai up -d --build")
@@ -1305,13 +1663,127 @@ def ai_status():
         info = ai_call("/health", timeout=2)
     except Exception:
         info = {}
+    try:
+        song_call("/health", timeout=2)
+        songs = True
+    except Exception:
+        songs = False
     return {"available": bool(info.get("ok")), "device": info.get("device"),
             "gpu": info.get("gpu"), "vram_mb": info.get("vram_mb"),
-            "jobs": ai_active()}
+            "songs": songs, "jobs": ai_active()}
+
+
+class SongReq(BaseModel):
+    title: str = ""
+    style: str                 # genre, mood, instruments, voice
+    lyrics: str = ""           # empty = instrumental
+    duration: int = 120        # seconds
+    bpm: int | None = None
+    key: str = ""
+    language: str = ""
+    seed: int | None = None
+
+
+def _song_fields(req) -> dict:
+    out = {"style": req.style.strip()[:512], "lyrics": req.lyrics.strip()[:4096]}
+    if getattr(req, "bpm", None):
+        out["bpm"] = max(30, min(300, req.bpm))
+    if getattr(req, "key", ""):
+        out["key_scale"] = req.key.strip()[:20]
+    if getattr(req, "language", ""):
+        out["vocal_language"] = req.language.strip()[:12]
+    if getattr(req, "seed", None):
+        out["seed"] = req.seed
+    return out
+
+
+@app.post("/api/studio/song")
+def studio_song(req: SongReq):
+    """Make a new song from a style description and (optionally) lyrics."""
+    if not req.style.strip():
+        raise HTTPException(400, "Describe the style of the song first")
+    label = (req.title.strip() or req.style.strip())[:80]
+    return ai_queue({"kind": "song", "label": label,
+                     "audio_duration": max(10, min(480, req.duration)),
+                     **_song_fields(req)}, songs=True)
+
+
+class CoverReq(BaseModel):
+    track_id: int
+    style: str
+    lyrics: str = ""
+    strength: float = 0.6      # 1 = stay close to the song, 0.2 = only its feel
+    title: str = ""
+
+
+class RepaintReq(BaseModel):
+    track_id: int
+    start: float
+    end: float
+    style: str
+    lyrics: str = ""
+    title: str = ""
+
+
+def _studio_source(track_id: int):
+    with db() as con:
+        row = con.execute("SELECT title,artist FROM tracks WHERE id=? AND "
+                          "status='ready'", (track_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "That song is not in the library")
+    return row
+
+
+@app.post("/api/studio/cover")
+def studio_cover(req: CoverReq):
+    """Re-make an existing song in another style."""
+    row = _studio_source(req.track_id)
+    if not req.style.strip():
+        raise HTTPException(400, "Describe the new style first")
+    return ai_queue({"kind": "cover", "track_id": req.track_id,
+                     "label": (req.title.strip()
+                               or f"{row['title']} (Cover)")[:120],
+                     "artist": row["artist"],
+                     "strength": max(0.1, min(1.0, req.strength)),
+                     **_song_fields(req)}, songs=True)
+
+
+@app.post("/api/studio/repaint")
+def studio_repaint(req: RepaintReq):
+    """Generate one part of a song again, keeping the rest."""
+    row = _studio_source(req.track_id)
+    if req.end <= req.start:
+        raise HTTPException(400, "The end must be after the start")
+    return ai_queue({"kind": "repaint", "track_id": req.track_id,
+                     "label": (req.title.strip()
+                               or f"{row['title']} (Edit)")[:120],
+                     "artist": row["artist"], "start": max(0.0, req.start),
+                     "end": req.end, **_song_fields(req)}, songs=True)
 
 
 class SplitReq(BaseModel):
     track_id: int
+
+
+class MashupReq(BaseModel):
+    base_id: int            # the song whose music (instrumental) is kept
+    vocal_ids: list[int]    # the songs whose vocals are laid over it
+    name: str = ""
+
+
+@app.post("/api/ai/mashup")
+def ai_mashup(req: MashupReq):
+    ids = [req.base_id, *req.vocal_ids]
+    if len(ids) < 2 or len(ids) > 4 or len(set(ids)) != len(ids):
+        raise HTTPException(400, "Pick two to four different songs")
+    with db() as con:
+        titles = {r["id"]: r["title"] for r in con.execute(
+            "SELECT id,title FROM tracks WHERE status='ready'")}
+    if any(i not in titles for i in ids):
+        raise HTTPException(404, "One of the songs is not in the library")
+    label = req.name.strip() or " × ".join(titles[i] for i in ids)
+    return ai_queue({"kind": "mashup", "base_id": req.base_id,
+                     "vocal_ids": req.vocal_ids, "label": label[:120]})
 
 
 class GenerateReq(BaseModel):
@@ -1770,6 +2242,7 @@ def settings():
             "clean_names": get_setting("clean_names", "1") == "1",
             "spotify_client_id": cid, "spotify_secret_set": bool(secret),
             "password_set": bool(_auth["hash"]),
+            "import_dir": str(IMPORT_DIR) if IMPORT_DIR.is_dir() else None,
             "stats": {"tracks": s["total"], "ready": s["ready"] or 0,
                       "failed": s["failed"] or 0, "lyrics": s["lyrics"] or 0,
                       "folders": folders, "bytes": size}}

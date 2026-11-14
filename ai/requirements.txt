@@ -1,4 +1,5 @@
 demucs
+librosa
 transformers>=4.44,<5
 sentencepiece
 protobuf
