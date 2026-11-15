@@ -23,6 +23,18 @@ Self-hosted web music player for your LAN. Works on desktop and phones.
 - **Live effects and louder volume**: the effects button on the player bar
   (and the row under the cover) switches Slowed, Sped up, Reverb, Bass and
   8D on the playing song at once. The volume slider goes up to 200%.
+- **Crossfade and even loudness**: songs blend into each other (0 to 12
+  seconds, Settings → Playback) and every song is measured once so quiet and
+  loud songs play at the same level.
+- **Profiles**: one library for the whole house; each profile (the round
+  button at the top) has its own likes, history, most played and folders.
+  Profiles have no passwords of their own.
+- **Devices (remote control)**: every device that has the player open shows
+  up under the devices button. Control what another one is playing (play,
+  pause, skip, seek, volume) or send it songs with right-click → Play on…
+- **Clean up** (Settings → Library): finds songs saved twice and merges
+  them, lists failed downloads and leftover files, and shows what uses the
+  disk.
 - **Phone**: bottom tabs, a floating mini player, swipe it up for the full
   player, sideways to change song, and swipe the full player down to close.
 

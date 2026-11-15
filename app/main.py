@@ -4,6 +4,7 @@ Sources: YouTube (search / links), Spotify links (resolved to YouTube audio),
 and files uploaded from the user's device. Extras: folders, lyrics (LRCLIB),
 server-side settings."""
 import base64
+import contextvars
 import hashlib
 import hmac
 import json
@@ -26,7 +27,7 @@ from contextlib import contextmanager
 from http.cookies import SimpleCookie
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                RedirectResponse, Response, StreamingResponse)
 from fastapi.staticfiles import StaticFiles
@@ -55,7 +56,7 @@ SPOTIFY_RE = re.compile(
 YOUTUBE_HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 TRACK_COLS = ("id,title,artist,duration,source,video_id,status,error,"
-              "lyrics_state,kind,liked,plays")
+              "lyrics_state,kind,gain")
 
 app = FastAPI(title="Sonara")
 jobs: "queue.Queue[tuple[str, object]]" = queue.Queue()
@@ -98,10 +99,19 @@ def init_db():
             path TEXT PRIMARY KEY, size INTEGER, mtime REAL);
         CREATE TABLE IF NOT EXISTS artists(
             name TEXT PRIMARY KEY, data TEXT, fetched REAL);
+        CREATE TABLE IF NOT EXISTS profiles(id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE IF NOT EXISTS profile_tracks(
+            profile_id INTEGER, track_id INTEGER, liked INTEGER DEFAULT 0,
+            plays INTEGER DEFAULT 0, last_played REAL,
+            PRIMARY KEY(profile_id, track_id));
         """)
         if "position" not in {r["name"] for r in
                               con.execute("PRAGMA table_info(playlists)")}:
             con.execute("ALTER TABLE playlists ADD COLUMN position INTEGER")
+        if "profile_id" not in {r["name"] for r in
+                                con.execute("PRAGMA table_info(playlists)")}:
+            con.execute("ALTER TABLE playlists ADD COLUMN profile_id INTEGER "
+                        "DEFAULT 1")
         cols = {r["name"] for r in con.execute("PRAGMA table_info(tracks)")}
         for name, ddl in (("file", "TEXT"), ("lyrics", "TEXT"),
                           ("lyrics_state", "TEXT"),
@@ -110,9 +120,18 @@ def init_db():
                           ("plays", "INTEGER DEFAULT 0"),
                           ("last_played", "REAL"), ("video_file", "TEXT"),
                           ("raw_title", "TEXT"), ("raw_artist", "TEXT"),
-                          ("lyrics_offset", "REAL DEFAULT 0")):
+                          ("lyrics_offset", "REAL DEFAULT 0"),
+                          ("gain", "REAL")):
             if name not in cols:
                 con.execute(f"ALTER TABLE tracks ADD COLUMN {name} {ddl}")
+        # Likes and play counts belong to a profile. The first profile takes
+        # over what was counted before profiles existed.
+        if not con.execute("SELECT 1 FROM profiles").fetchone():
+            con.execute("INSERT INTO profiles(id,name) VALUES(1,'Me')")
+            con.execute(
+                "INSERT OR IGNORE INTO profile_tracks SELECT 1,id,liked,"
+                "COALESCE(plays,0),last_played FROM tracks WHERE liked=1 "
+                "OR COALESCE(plays,0)>0")
         con.execute("UPDATE tracks SET file=video_id||'.m4a' WHERE file IS NULL "
                     "AND status='ready' AND video_id IS NOT NULL")
         # Older versions kept a separate "ytv:" row for the video copy of a
@@ -231,6 +250,34 @@ def set_cookie(resp, token: str):
                     samesite="lax")
 
 
+# Which profile a request is for (likes, history and folders are per
+# profile). The page sends it with every request; without it, the first.
+_profile: contextvars.ContextVar = contextvars.ContextVar("profile", default=1)
+_profile_ids = {1}
+
+
+def header_profile(scope) -> int:
+    for k, v in scope.get("headers") or []:
+        if k == b"x-profile":
+            try:
+                return int(v)
+            except ValueError:
+                return 1
+    return 1
+
+
+def profile_id() -> int:
+    p = _profile.get()
+    return p if p in _profile_ids else 1
+
+
+def load_profiles():
+    with db() as con:
+        _profile_ids.clear()
+        _profile_ids.update(r["id"] for r in con.execute(
+            "SELECT id FROM profiles"))
+
+
 class AuthMiddleware:
     def __init__(self, inner):
         self.inner = inner
@@ -238,6 +285,7 @@ class AuthMiddleware:
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
             path = scope["path"]
+            _profile.set(header_profile(scope))
             if (path.startswith(("/api/", "/media/")) and path not in OPEN_PATHS
                     and not is_authed(scope)):
                 resp = JSONResponse({"detail": "Login required"}, 401)
@@ -710,10 +758,13 @@ def playlist_append(con, pid: int, tid: int):
                 (pid, tid, pos))
 
 
-def make_playlist(name: str, url: str, source: str, track_ids: list[int]):
+def make_playlist(name: str, url: str, source: str, track_ids: list[int],
+                  profile: int = 1):
+    if profile != 1:  # each profile gets its own copy of an imported playlist
+        url = f"{url}#p{profile}"
     with db() as con:
-        con.execute("INSERT OR IGNORE INTO playlists(name,url,source) "
-                    "VALUES(?,?,?)", (name, url, source))
+        con.execute("INSERT OR IGNORE INTO playlists(name,url,source,"
+                    "profile_id) VALUES(?,?,?,?)", (name, url, source, profile))
         pid = con.execute("SELECT id FROM playlists WHERE url=?",
                           (url,)).fetchone()["id"]
         for pos, tid in enumerate(track_ids):
@@ -725,7 +776,7 @@ def yt_ext(video_id: str, kind: str) -> str:
     return "yt:" + video_id
 
 
-def place(ids, name, url, source, playlist, nofolder):
+def place(ids, name, url, source, playlist, nofolder, profile=1):
     """Where a multi-song import goes: a chosen folder, none, or its own."""
     if playlist:
         with db() as con:
@@ -735,11 +786,11 @@ def place(ids, name, url, source, playlist, nofolder):
                     playlist_append(con, playlist, tid)
                 return
     if not nofolder:
-        make_playlist(name, url, source, ids)
+        make_playlist(name, url, source, ids, profile)
 
 
 def do_import(url: str, kind: str = "video", skip=(), playlist=None,
-              nofolder=False):
+              nofolder=False, profile=1):
     m = SPOTIFY_RE.search(url)
     if m:
         kind, sid = m.groups()
@@ -749,7 +800,7 @@ def do_import(url: str, kind: str = "video", skip=(), playlist=None,
                          t["duration"], "spotify") for t in tracks if t["id"]]
         if kind != "track" or playlist:
             place(ids, name, f"spotify:{kind}:{sid}", "spotify", playlist,
-                  nofolder or kind == "track")
+                  nofolder or kind == "track", profile)
         notify(f"Spotify: queued {len(ids)} track(s) from “{name}”")
         return
     single = "watch?v=" in url or "youtu.be/" in url or "/shorts/" in url
@@ -765,7 +816,7 @@ def do_import(url: str, kind: str = "video", skip=(), playlist=None,
                                      t["video_id"], kind))
         name = info.get("title") or "YouTube playlist"
         place(ids, name, f"youtube:{info.get('id') or url}", "youtube",
-              playlist, nofolder)
+              playlist, nofolder, profile)
         notify(f"YouTube: queued {len(ids)} track(s) from “{name}”")
     else:
         t = entry_dict(info)
@@ -930,6 +981,7 @@ def worker():
 def startup():
     init_db()
     load_auth()
+    load_profiles()
     with db() as con:  # resume anything interrupted by a restart
         con.execute("UPDATE tracks SET status='queued' WHERE status='downloading'")
         pending = [r["id"] for r in con.execute(
@@ -939,6 +991,7 @@ def startup():
     for _ in range(max(1, WORKERS)):
         threading.Thread(target=worker, daemon=True).start()
     threading.Thread(target=watch_import, daemon=True).start()
+    threading.Thread(target=loudness_worker, daemon=True).start()
 
 
 # ------------------------------------------------------------------ upload
@@ -1081,7 +1134,7 @@ def scan_import() -> int:
                     with db() as con:
                         row = con.execute(
                             "SELECT id FROM playlists WHERE name=? AND "
-                            "source='folder'", (rel.parts[0],)).fetchone()
+                            "source='folder' AND COALESCE(profile_id,1)=1", (rel.parts[0],)).fetchone()
                         pid = row["id"] if row else con.execute(
                             "INSERT INTO playlists(name,url,source) "
                             "VALUES(?,?,?)", (rel.parts[0],
@@ -1139,7 +1192,14 @@ def thumb(video_id: str):
 # ------------------------------------------------------- search everywhere
 def track_cols() -> str:
     return (",".join("t." + c for c in TRACK_COLS.split(","))
-            + ",t.video_file IS NOT NULL AS vfile")
+            + ",t.video_file IS NOT NULL AS vfile,COALESCE(pt.liked,0) AS "
+              "liked,COALESCE(pt.plays,0) AS plays")
+
+
+def tracks_from() -> str:
+    """The tracks table with the current profile's likes and play counts."""
+    return ("tracks t LEFT JOIN profile_tracks pt ON pt.track_id=t.id AND "
+            f"pt.profile_id={profile_id()}")
 
 
 @app.get("/api/library/search")
@@ -1150,8 +1210,8 @@ def library_search(q: str):
     like = "%" + q.replace("%", "").replace("_", " ") + "%"
     with db() as con:
         return [dict(r) for r in con.execute(
-            f"SELECT {track_cols()} FROM tracks t WHERE t.title LIKE ? OR "
-            "t.artist LIKE ? ORDER BY t.plays DESC, t.id DESC LIMIT 30",
+            f"SELECT {track_cols()} FROM {tracks_from()} WHERE t.title LIKE "
+            "? OR t.artist LIKE ? ORDER BY plays DESC, t.id DESC LIMIT 30",
             (like, like))]
 
 
@@ -1277,7 +1337,8 @@ def import_url(req: ImportReq):
     if not ok:
         raise HTTPException(400, "Only YouTube and Spotify links are supported")
     jobs.put(("import", (url, "video" if req.kind == "video" else "audio",
-                         tuple(req.skip), req.playlist, req.nofolder)))
+                         tuple(req.skip), req.playlist, req.nofolder,
+                         profile_id())))
     return {"ok": True}
 
 
@@ -1950,23 +2011,22 @@ def restore_names():
 
 @app.get("/api/tracks")
 def tracks(playlist: int | None = None, view: str = ""):
-    cols = (",".join("t." + c for c in TRACK_COLS.split(","))
-            + ",t.video_file IS NOT NULL AS vfile")
-    smart = {"liked": "WHERE liked=1 ORDER BY id DESC",
-             "recent": "WHERE last_played IS NOT NULL "
-                       "ORDER BY last_played DESC LIMIT 100",
-             "top": "WHERE plays>0 ORDER BY plays DESC, last_played DESC "
-                    "LIMIT 100"}
+    cols, src = track_cols(), tracks_from()
+    smart = {"liked": "WHERE pt.liked=1 ORDER BY t.id DESC",
+             "recent": "WHERE pt.last_played IS NOT NULL "
+                       "ORDER BY pt.last_played DESC LIMIT 100",
+             "top": "WHERE pt.plays>0 ORDER BY pt.plays DESC, "
+                    "pt.last_played DESC LIMIT 100"}
     with db() as con:
         if view in smart:
-            rows = con.execute(f"SELECT {cols} FROM tracks t {smart[view]}")
+            rows = con.execute(f"SELECT {cols} FROM {src} {smart[view]}")
         elif playlist:
             rows = con.execute(
-                f"SELECT {cols} FROM tracks t JOIN playlist_tracks p ON "
+                f"SELECT {cols} FROM {src} JOIN playlist_tracks p ON "
                 "p.track_id=t.id WHERE p.playlist_id=? ORDER BY p.position",
                 (playlist,))
         else:
-            rows = con.execute(f"SELECT {cols} FROM tracks t ORDER BY id DESC")
+            rows = con.execute(f"SELECT {cols} FROM {src} ORDER BY t.id DESC")
         return [dict(r) for r in rows]
 
 
@@ -1988,16 +2048,21 @@ def edit_track(tid: int, req: TrackEdit):
 @app.post("/api/tracks/{tid}/like")
 def like(tid: int, req: LikeReq):
     with db() as con:
-        con.execute("UPDATE tracks SET liked=? WHERE id=?",
-                    (1 if req.liked else 0, tid))
+        con.execute(
+            "INSERT INTO profile_tracks(profile_id,track_id,liked) VALUES(?,?,?) "
+            "ON CONFLICT(profile_id,track_id) DO UPDATE SET liked=excluded.liked",
+            (profile_id(), tid, 1 if req.liked else 0))
     return {"ok": True}
 
 
 @app.post("/api/tracks/{tid}/played")
 def played(tid: int):
     with db() as con:
-        con.execute("UPDATE tracks SET plays=COALESCE(plays,0)+1,last_played=? "
-                    "WHERE id=?", (time.time(), tid))
+        con.execute(
+            "INSERT INTO profile_tracks(profile_id,track_id,plays,last_played) "
+            "VALUES(?,?,1,?) ON CONFLICT(profile_id,track_id) DO UPDATE SET "
+            "plays=plays+1,last_played=excluded.last_played",
+            (profile_id(), tid, time.time()))
     return {"ok": True}
 
 
@@ -2033,6 +2098,7 @@ def delete_track(tid: int):
             cancelled.add(tid)  # stops the download if it is running
         con.execute("DELETE FROM tracks WHERE id=?", (tid,))
         con.execute("DELETE FROM playlist_tracks WHERE track_id=?", (tid,))
+        con.execute("DELETE FROM profile_tracks WHERE track_id=?", (tid,))
         names = {n for n in (row["file"], row["video_file"]) if n}
         keep = {n for n in names if con.execute(
             "SELECT 1 FROM tracks WHERE file=? OR video_file=?", (n, n)).fetchone()}
@@ -2167,7 +2233,9 @@ def playlists():
         return [dict(r) for r in con.execute(
             "SELECT p.id,p.name,p.source, (SELECT COUNT(*) FROM playlist_tracks "
             "WHERE playlist_id=p.id) AS count FROM playlists p "
-            "ORDER BY p.position IS NULL, p.position, p.name COLLATE NOCASE")]
+            "WHERE COALESCE(p.profile_id,1)=? "
+            "ORDER BY p.position IS NULL, p.position, p.name COLLATE NOCASE",
+            (profile_id(),))]
 
 
 @app.put("/api/playlists/order")
@@ -2189,8 +2257,9 @@ def create_folder(req: NameReq):
     if not name:
         raise HTTPException(400, "Name is required")
     with db() as con:
-        cur = con.execute("INSERT INTO playlists(name,url,source) VALUES(?,?,?)",
-                          (name, f"folder:{uuid.uuid4().hex}", "folder"))
+        cur = con.execute(
+            "INSERT INTO playlists(name,url,source,profile_id) VALUES(?,?,?,?)",
+            (name, f"folder:{uuid.uuid4().hex}", "folder", profile_id()))
         return {"id": cur.lastrowid, "name": name}
 
 
@@ -2321,9 +2390,320 @@ def where(video_id: str):
             raise HTTPException(404, "Not in the library")
         pl = con.execute(
             "SELECT p.id,p.name,p.source FROM playlists p JOIN playlist_tracks "
-            "pt ON pt.playlist_id=p.id WHERE pt.track_id=? ORDER BY p.id LIMIT 1",
-            (row["id"],)).fetchone()
+            "pt ON pt.playlist_id=p.id WHERE pt.track_id=? AND "
+            "COALESCE(p.profile_id,1)=? ORDER BY p.id LIMIT 1",
+            (row["id"], profile_id())).fetchone()
     return {"id": row["id"], "playlist": dict(pl) if pl else None}
+
+
+# ------------------------------------------------------------ even loudness
+# Every song gets a gain (in dB) that brings it to the same loudness, so a
+# quiet song and a loud one play at the same level. The player applies it.
+LOUD_TARGET = -14.0  # LUFS, the level streaming services play at
+
+
+def measure_gain(path: Path) -> float:
+    r = subprocess.run(
+        ["ffmpeg", "-nostats", "-hide_banner", "-i", str(path), "-vn", "-af",
+         "ebur128=peak=true:framelog=quiet", "-f", "null", "-"],
+        capture_output=True, text=True, timeout=600)
+    out = r.stderr[r.stderr.rfind("Summary:"):]
+    loud = re.search(r"I:\s+(-?[\d.]+) LUFS", out)
+    peak = re.search(r"Peak:\s+(-?[\d.]+) dBFS", out)
+    if not loud or float(loud.group(1)) < -60:  # unreadable or silent
+        return 0.0
+    gain = LOUD_TARGET - float(loud.group(1))
+    if peak and gain > 0:  # turning up: stop before the loudest moment clips
+        gain = min(gain, max(0.0, -1.0 - float(peak.group(1))))
+    return round(max(-14.0, min(gain, 9.0)), 2)
+
+
+def loudness_worker():
+    while True:
+        try:
+            with db() as con:
+                rows = con.execute(
+                    "SELECT id,file FROM tracks WHERE status='ready' AND file "
+                    "IS NOT NULL AND gain IS NULL LIMIT 20").fetchall()
+            if not rows:
+                time.sleep(20)
+                continue
+            for r in rows:
+                try:
+                    gain = measure_gain(MUSIC / Path(r["file"]).name)
+                except Exception:
+                    gain = 0.0
+                with db() as con:
+                    con.execute("UPDATE tracks SET gain=? WHERE id=?",
+                                (gain, r["id"]))
+        except Exception:
+            time.sleep(60)
+
+
+# ----------------------------------------------------------------- profiles
+# One library, several people: each profile has its own likes, history,
+# play counts and folders. There is no password per profile.
+@app.get("/api/profiles")
+def profiles():
+    with db() as con:
+        rows = [dict(r) for r in con.execute(
+            "SELECT id,name FROM profiles ORDER BY id")]
+    return {"current": profile_id(), "profiles": rows}
+
+
+@app.post("/api/profiles")
+def create_profile(req: NameReq):
+    name = req.name.strip()[:30]
+    if not name:
+        raise HTTPException(400, "Name is required")
+    with db() as con:
+        if con.execute("SELECT COUNT(*) c FROM profiles").fetchone()["c"] >= 12:
+            raise HTTPException(400, "That is the most profiles there can be")
+        pid = con.execute("INSERT INTO profiles(name) VALUES(?)",
+                          (name,)).lastrowid
+    load_profiles()
+    return {"id": pid, "name": name}
+
+
+@app.patch("/api/profiles/{pid}")
+def rename_profile(pid: int, req: NameReq):
+    name = req.name.strip()[:30]
+    if not name:
+        raise HTTPException(400, "Name is required")
+    with db() as con:
+        con.execute("UPDATE profiles SET name=? WHERE id=?", (name, pid))
+    return {"ok": True}
+
+
+@app.delete("/api/profiles/{pid}")
+def delete_profile(pid: int):
+    """Removes the profile with its likes, history and folders. The songs
+    themselves stay in the library."""
+    if pid == 1:
+        raise HTTPException(400, "The first profile cannot be deleted")
+    with db() as con:
+        con.execute("DELETE FROM playlist_tracks WHERE playlist_id IN "
+                    "(SELECT id FROM playlists WHERE profile_id=?)", (pid,))
+        con.execute("DELETE FROM playlists WHERE profile_id=?", (pid,))
+        con.execute("DELETE FROM profile_tracks WHERE profile_id=?", (pid,))
+        con.execute("DELETE FROM profiles WHERE id=?", (pid,))
+    load_profiles()
+    return {"ok": True}
+
+
+# ----------------------------------------------------------------- clean-up
+JUNK_WORDS = re.compile(
+    r"\b(official|video|audio|lyrics?|lyric video|music video|hd|hq|4k|"
+    r"remaster(ed)?|visuali[sz]er|mv|clip|full)\b", re.I)
+
+
+def song_key(title: str, artist: str) -> str:
+    """Two downloads of the same song should get the same key."""
+    t = re.sub(r"[\(\[\{].*?[\)\]\}]", " ", (title or "").lower())
+    t = JUNK_WORDS.sub(" ", t)
+    a = re.split(r",|&| x | feat\.?| ft\.?", (artist or "").lower())[0]
+    clean = lambda s: re.sub(r"[\W_]+", "", s)
+    return f"{clean(a)}|{clean(t)}" if clean(t) else ""
+
+
+def file_size(name) -> int:
+    try:
+        return (MUSIC / Path(name).name).stat().st_size if name else 0
+    except OSError:
+        return 0
+
+
+def unused_files() -> list[Path]:
+    """Files in the music folder that no song points to (left behind by an
+    interrupted download or an old version). Fresh files are left alone."""
+    with db() as con:
+        used = {Path(n).name for r in con.execute(
+            "SELECT file,video_file FROM tracks") for n in r if n}
+    now = time.time()
+    return [f for f in MUSIC.iterdir() if f.is_file() and f.name not in used
+            and now - f.stat().st_mtime > 3600]
+
+
+@app.get("/api/cleanup")
+def cleanup():
+    with db() as con:
+        rows = [dict(r) for r in con.execute(
+            "SELECT t.id,t.title,t.artist,t.duration,t.source,t.video_id,"
+            "t.status,t.error,t.kind,t.file,t.video_file,"
+            "(SELECT COALESCE(SUM(plays),0) FROM profile_tracks WHERE "
+            "track_id=t.id) AS plays,"
+            "(SELECT COALESCE(MAX(liked),0) FROM profile_tracks WHERE "
+            "track_id=t.id) AS liked,"
+            "(SELECT COUNT(*) FROM playlist_tracks WHERE track_id=t.id) "
+            "AS folders FROM tracks t")]
+        folders = [dict(r) for r in con.execute(
+            "SELECT p.id,p.name,COUNT(pt.track_id) AS count FROM playlists p "
+            "LEFT JOIN playlist_tracks pt ON pt.playlist_id=p.id GROUP BY p.id")]
+        members = con.execute("SELECT playlist_id,track_id FROM "
+                              "playlist_tracks").fetchall()
+    size = {}
+    for r in rows:
+        r["audio_bytes"] = file_size(r.pop("file"))
+        video = r.pop("video_file")
+        r["video_bytes"] = file_size(video) if video else 0
+        r["vfile"] = bool(video)
+        r["bytes"] = size[r["id"]] = r["audio_bytes"] + r["video_bytes"]
+    ready = [r for r in rows if r["status"] == "ready"]
+    groups: dict[str, list] = {}
+    for r in ready:
+        key = song_key(r["title"], r["artist"])
+        if key:
+            groups.setdefault(key, []).append(r)
+    dupes = []
+    for g in groups.values():
+        # the same name with a very different length is another version
+        g.sort(key=lambda r: r["duration"] or 0)
+        run = [g[0]]
+        for r in g[1:]:
+            if abs((r["duration"] or 0) - (run[-1]["duration"] or 0)) <= 6:
+                run.append(r)
+            else:
+                if len(run) > 1:
+                    dupes.append(run)
+                run = [r]
+        if len(run) > 1:
+            dupes.append(run)
+    for g in dupes:  # the best copy first: with video, then biggest, then most played
+        g.sort(key=lambda r: (-r["vfile"], -r["audio_bytes"], -r["plays"], r["id"]))
+    dupes.sort(key=lambda g: -sum(r["bytes"] for r in g[1:]))
+    per_folder = {f["id"]: 0 for f in folders}
+    for m in members:
+        if m["playlist_id"] in per_folder:
+            per_folder[m["playlist_id"]] += size.get(m["track_id"], 0)
+    for f in folders:
+        f["bytes"] = per_folder[f["id"]]
+    unused = unused_files()
+    return {
+        "duplicates": dupes,
+        "failed": [r for r in rows if r["status"] == "error"],
+        "big": sorted(ready, key=lambda r: -r["bytes"])[:15],
+        "folders": sorted(folders, key=lambda f: -f["bytes"]),
+        "usage": {"songs": len(ready),
+                  "audio": sum(r["audio_bytes"] for r in rows),
+                  "video": sum(r["video_bytes"] for r in rows),
+                  "unused": sum(f.stat().st_size for f in unused),
+                  "unused_files": len(unused)},
+    }
+
+
+class MergeReq(BaseModel):
+    keep: int
+    remove: list[int]
+
+
+@app.post("/api/cleanup/merge")
+def cleanup_merge(req: MergeReq):
+    """Delete duplicate copies of a song. The copy that stays takes over
+    their folders, likes and play counts, so nothing is lost."""
+    gone = [i for i in req.remove if i != req.keep]
+    with db() as con:
+        if not con.execute("SELECT 1 FROM tracks WHERE id=?",
+                           (req.keep,)).fetchone():
+            raise HTTPException(404, "The song to keep is gone")
+        for tid in gone:
+            for m in con.execute("SELECT playlist_id,position FROM "
+                                 "playlist_tracks WHERE track_id=?",
+                                 (tid,)).fetchall():
+                con.execute("INSERT OR IGNORE INTO playlist_tracks VALUES(?,?,?)",
+                            (m["playlist_id"], req.keep, m["position"]))
+            for p in con.execute("SELECT * FROM profile_tracks WHERE "
+                                 "track_id=?", (tid,)).fetchall():
+                con.execute(
+                    "INSERT INTO profile_tracks VALUES(?,?,?,?,?) ON CONFLICT"
+                    "(profile_id,track_id) DO UPDATE SET liked=MAX(liked,"
+                    "excluded.liked),plays=plays+excluded.plays,last_played="
+                    "MAX(COALESCE(last_played,0),COALESCE(excluded.last_played,0))",
+                    (p["profile_id"], req.keep, p["liked"], p["plays"],
+                     p["last_played"]))
+    done = 0
+    for tid in gone:
+        try:
+            delete_track(tid)
+            done += 1
+        except HTTPException:
+            pass
+    return {"deleted": done}
+
+
+@app.post("/api/cleanup/unused")
+def cleanup_unused():
+    """Delete files in the music folder that no song uses any more."""
+    if jobs.unfinished_tasks:
+        raise HTTPException(409, "Wait until the downloads have finished")
+    freed = n = 0
+    for f in unused_files():
+        try:
+            freed += f.stat().st_size
+            f.unlink()
+            n += 1
+        except OSError:
+            pass
+    return {"files": n, "bytes": freed}
+
+
+# ----------------------------------------------------------- remote control
+# Every open player keeps a small live connection to the server and says
+# what it is playing. Any of them can then send a command (play, pause,
+# next, volume...) to another one, like a remote control.
+_devices: dict[str, dict] = {}
+
+
+async def tell_devices():
+    listing = {"type": "devices", "devices": [
+        {"id": k, "name": d["name"], "state": d["state"]}
+        for k, d in _devices.items()]}
+    for d in list(_devices.values()):
+        try:
+            await d["ws"].send_json(listing)
+        except Exception:
+            pass
+
+
+@app.websocket("/ws")
+async def device_socket(sock: WebSocket):
+    # same sign-in as the rest, and only from the player's own page
+    origin = urllib.parse.urlparse(sock.headers.get("origin") or "").netloc
+    if not is_authed(sock.scope) or (origin and origin != sock.headers.get("host")):
+        return await sock.close(code=4401)
+    await sock.accept()
+    me = None
+    try:
+        while True:
+            m = await sock.receive_json()
+            kind = m.get("type")
+            if kind == "hello" and m.get("id"):
+                me = str(m["id"])[:40]
+                _devices[me] = {"ws": sock, "name": str(m.get("name") or
+                                                        "Device")[:60],
+                                "state": None}
+                await tell_devices()
+            elif not me:
+                continue
+            elif kind == "name":
+                _devices[me]["name"] = str(m.get("name") or "Device")[:60]
+                await tell_devices()
+            elif kind == "state":
+                state = m.get("state")
+                if state is None or len(json.dumps(state)) < 4000:
+                    _devices[me]["state"] = state
+                    await tell_devices()
+            elif kind == "cmd":
+                target = _devices.get(str(m.get("to")))
+                if target:
+                    await target["ws"].send_json({
+                        "type": "cmd", "from": me, "cmd": m.get("cmd"),
+                        "value": m.get("value")})
+    except Exception:
+        pass  # the page was closed or the connection dropped
+    finally:
+        if me and _devices.get(me, {}).get("ws") is sock:
+            del _devices[me]
+            await tell_devices()
 
 
 STATIC = Path(__file__).parent / "static"

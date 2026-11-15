@@ -25,6 +25,7 @@
     <button class="nav" data-view="top"><i data-ico="trending"></i><span>Most played</span></button>
     <button class="nav" data-view="folders"><i data-ico="folder"></i><span>Folders</span></button>
     <button class="nav" data-view="remix"><i data-ico="tune"></i><span>Remix</span></button>
+    <button class="nav" id="navMore" title="Pages you unpinned" hidden><i data-ico="more"></i><span>More</span></button>
     <div class="side-h"><span>Folders &amp; playlists</span><button id="newFolder" class="icon-btn" title="New folder"><i data-ico="plus"></i></button></div>
     <div id="pls" class="pls"></div>
   </aside>
@@ -38,6 +39,7 @@
         <input id="q" placeholder="Search YouTube or paste a YouTube / Spotify link" autocomplete="off" enterkeyhint="search">
       </form>
       <button id="uploadBtn" class="btn ghost" title="Add music from this device"><i data-ico="upload"></i><span>Upload</span></button>
+      <button id="profBtn" class="prof-btn" title="Profile: who is listening"><span class="avatar" id="profAv">M</span><span id="profName">Me</span></button>
       <button id="setBtn" class="icon-btn top-set" title="Settings"><i data-ico="gear"></i></button>
       <input id="file" type="file" multiple hidden accept="audio/*,video/*,.mp3,.m4a,.flac,.wav,.ogg,.opus,.aac,.wma,.mp4,.mkv,.webm,.mov">
     </header>
@@ -67,6 +69,7 @@
     <button class="icon-btn heart" id="likeBtn" title="Like" hidden><i data-ico="heartLine"></i></button>
     <button class="icon-btn" id="lyricsBtn" title="Lyrics"><i data-ico="lyrics"></i></button>
     <button class="icon-btn" id="queueBtn" title="Queue"><i data-ico="queue"></i></button>
+    <button class="icon-btn" id="devBtn" title="Devices"><i data-ico="devices"></i></button>
     <button class="icon-btn" id="fxBtn" title="Effects: slowed, reverb, 8D"><i data-ico="tune"></i></button>
     <i data-ico="volume"></i>
     <input id="vol" type="range" min="0" max="2" step="0.01" value="1" aria-label="Volume">
@@ -106,6 +109,7 @@
       <div class="np-act">
         <button class="icon-btn heart" id="npLike" title="Like" hidden><i data-ico="heartLine"></i></button>
         <button class="icon-btn" id="npQueue" title="Queue"><i data-ico="queue"></i></button>
+        <button class="icon-btn" id="npDev" title="Devices"><i data-ico="devices"></i></button>
         <button class="icon-btn" id="fsBtn" title="Full screen" hidden><i data-ico="fullscreen"></i></button>
       </div>
       <div id="npFx"></div>

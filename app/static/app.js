@@ -9,6 +9,9 @@ document.querySelector('.app').append($('np'));
 
 // ---------------------------------------------------------------- icons
 const ICONS = {
+  devices: 'M4 6h18V4H4c-1.1 0-2 .9-2 2v11H0v3h14v-3H4V6zm19 2h-6c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h6c.55 0 1-.45 1-1V9c0-.55-.45-1-1-1zm-1 9h-4v-7h4v7z',
+  person: 'M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z',
+  check: 'M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z',
   play: 'M8 5v14l11-7z', pause: 'M6 19h4V5H6zm8-14v14h4V5z',
   next: 'M6 18l8.5-6L6 6zm10-12v12h2V6z', prev: 'M6 6h2v12H6zm3.5 6l8.5 6V6z',
   shuffle: 'M10.59 9.17L5.41 4 4 5.41l5.17 5.17zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4zm.33 9.41l-1.41 1.41 3.13 3.13L14.5 20H20v-5.5l-2.04 2.04z',
@@ -65,7 +68,7 @@ const EQ_PRESETS = {
   Acoustic: [5, 5, 3, 1, 2, 2, 3, 4, 3, 2],
   'Late night': [4, 3, 1, 0, 1, 2, 2, 1, -2, -4],
 };
-const prefs = Object.assign({ theme: 'dark', accent: ACCENTS[0][0], anim: true, compact: false, speed: 1, eq: EQ_PRESETS.Flat.slice(), eqOn: true, eqPreset: 'Flat', viz: 'bars', ytMode: 'ask', avMode: 'video', resume: true, sort: 'default', volume: 1, panel: true, src: 'all', coverTheme: true, studio: 'create' }, load('prefs', {}));
+const prefs = Object.assign({ theme: 'dark', accent: ACCENTS[0][0], anim: true, compact: false, speed: 1, eq: EQ_PRESETS.Flat.slice(), eqOn: true, eqPreset: 'Flat', viz: 'bars', ytMode: 'ask', avMode: 'video', resume: true, sort: 'default', volume: 1, panel: true, src: 'all', coverTheme: true, studio: 'create', loud: true, xfade: 5 }, load('prefs', {}));
 if (!Array.isArray(prefs.eq) || prefs.eq.length !== EQ_F.length) { prefs.eq = EQ_PRESETS.Flat.slice(); prefs.eqPreset = 'Flat'; }
 function load(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } }
 function save(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
@@ -176,12 +179,13 @@ function paintFx() {
 // sound is made louder than the original (it can distort on loud songs).
 function setVolume(v) {
   if (Math.abs(v - 1) < 0.04) v = 1;  // easy to land on exactly 100%
-  prefs.volume = v; audio.volume = Math.min(v, 1);
+  prefs.volume = v; applyVol();
   if (v > 1) { ensureEq(); actx?.resume(); }
   if (fx) fx.boost.gain.value = Math.max(v, 1);
   const r = document.getElementById('vol');
   r.value = v; fill(r); r.classList.toggle('boost', v > 1);
   r.title = `Volume ${Math.round(v * 100)}%` + (v > 1 ? ' — louder than the original' : '');
+  tellState();
   const pct = document.getElementById('volPct'), back = document.getElementById('volReset');
   pct.textContent = Math.round(v * 100) + '%'; pct.classList.toggle('boost', v > 1);
   back.hidden = v === 1;
@@ -232,8 +236,11 @@ const coverUrl = t => t.cover ? t.cover : t.video_id ?`https://i.ytimg.com/vi/${
 function setImg(img, t) { img.onerror = () => { img.onerror = null; img.src = placeholder(t); }; img.src = coverUrl(t); }
 function fill(r) { const max = +r.max || 1, min = +r.min || 0; r.style.setProperty('--p', ((r.value - min) / (max - min) * 100) + '%'); }
 
+// The profile in use on this browser; sent with every request.
+const profile = { id: load('profile', 1), list: [] };
 async function api(path, opts = {}) {
-  if (opts.body && !(opts.body instanceof Blob)) { opts.headers = { 'Content-Type': 'application/json' }; opts.body = JSON.stringify(opts.body); }
+  opts.headers = { ...(opts.headers || {}), 'X-Profile': profile.id };
+  if (opts.body && !(opts.body instanceof Blob)) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(opts.body); }
   const r = await fetch(path, opts);
   if (r.status === 401 && path !== '/api/login') { showLogin(); throw new Error('Login required'); }
   if (!r.ok) { let m = r.statusText; try { m = (await r.json()).detail || m; } catch {} throw new Error(m); }
@@ -377,6 +384,7 @@ function trackMenu(t, anchor) {
     items.push({ icon: 'play', label: 'Play now', fn: () => { if (state.shown.some(x => x.id === t.id)) playFrom(t.id); else { state.queue = [t]; playIndex(0); } } });
     items.push({ icon: 'queue', label: 'Play next', fn: () => playNext(t) });
     items.push({ icon: 'plus', label: 'Add to queue', fn: () => addToQueue(t) });
+    items.push(...deviceItems(t));
     items.push({ icon: t.liked ? 'heart' : 'heartLine', label: t.liked ? 'Remove from Liked' : 'Like', fn: () => toggleLike(t) });
     items.push({ icon: 'lyrics', label: 'Show lyrics', fn: () => { if (!current() || current().id !== t.id) playFrom(t.id); openNp(); } });
   }
@@ -791,6 +799,59 @@ function setActive() {
   $$('.side .nav[data-view], .tabs button').forEach(b => b.classList.toggle('active',
     b.dataset.view === v.type || (b.dataset.view === 'folders' && b.closest('.tabs') && ['playlist', 'recent', 'top'].includes(v.type))));
   $$('#pls .nav').forEach(b => b.classList.toggle('active', v.type === 'playlist' && +b.dataset.id === v.id));
+  $('navMore').classList.toggle('active', (prefs.unpinned || []).includes(v.type));
+}
+
+// Pin or unpin the pages of the sidebar. An unpinned page leaves the list
+// but is not lost: it moves under "More", from where it can be opened or
+// pinned again. Home always stays.
+const NAV_ICON = { home: 'home', search: 'search', library: 'music', liked: 'heart', recent: 'history', top: 'trending', folders: 'folder', remix: 'tune' };
+const navBtns = () => [...document.querySelectorAll('.side .nav[data-view]')];
+const navName = b => b.querySelector('span').textContent;
+function applyNav() {
+  const off = prefs.unpinned || [];
+  navBtns().forEach(b => { b.hidden = off.includes(b.dataset.view); });
+  $('navMore').hidden = !off.length;
+  setActive();
+}
+function setPinned(view, on) {
+  prefs.unpinned = (prefs.unpinned || []).filter(v => v !== view);
+  if (!on && view !== 'home') prefs.unpinned.push(view);
+  save('prefs', prefs); applyNav();
+}
+function navDialog() {
+  const wrap = el('div', 'modal dlg-wrap'), form = el('form', 'dlg');
+  form.append(el('h3', null, 'Sidebar pages'), el('p', null, 'Pinned pages show in the sidebar. The others wait under “More”.'));
+  for (const b of navBtns()) {
+    const lab = el('label', 'dlg-opt'), c = el('input'), view = b.dataset.view;
+    c.type = 'checkbox'; c.checked = !b.hidden; c.disabled = view === 'home';
+    const ico = el('i', 'dlg-ico'); ico.innerHTML = svg(NAV_ICON[view]);
+    lab.append(c, ico, el('span', null, navName(b) + (view === 'home' ? ' (always shown)' : '')));
+    lab.classList.toggle('sel', c.checked);
+    c.onchange = () => { setPinned(view, c.checked); lab.classList.toggle('sel', c.checked); };
+    form.append(lab);
+  }
+  const row = el('div', 'dlg-act'), all = el('button', 'btn ghost', 'Pin all'), ok = el('button', 'btn', 'Done');
+  all.type = 'button';
+  all.onclick = () => { prefs.unpinned = []; save('prefs', prefs); applyNav(); form.querySelectorAll('input').forEach(c => { c.checked = true; c.parentNode.classList.add('sel'); }); };
+  row.append(all, ok); form.append(row); wrap.append(form); document.body.append(wrap);
+  const done = () => wrap.remove();
+  wrap.onpointerdown = e => { if (e.target === wrap) done(); };
+  wrap.onkeydown = e => { e.stopPropagation(); if (e.key === 'Escape') done(); };
+  form.onsubmit = e => { e.preventDefault(); done(); };
+  ok.focus();
+}
+function navMenu(b, anchor) {
+  const items = [];
+  if (b.dataset.view !== 'home') items.push({ icon: 'minus', label: 'Unpin from the sidebar', fn: () => { setPinned(b.dataset.view, false); toast(`“${navName(b)}” moved under More`); } });
+  items.push({ icon: 'tune', label: 'Choose sidebar pages…', fn: navDialog });
+  openMenu(anchor, items, navName(b));
+  b.classList.add('menu-on');
+}
+function moreMenu(anchor) {
+  const items = navBtns().filter(b => b.hidden).map(b => ({ icon: NAV_ICON[b.dataset.view], label: navName(b), fn: () => b.click() }));
+  items.push({ icon: 'tune', label: 'Pin or unpin pages…', fn: navDialog });
+  openMenu(anchor, items, 'More');
 }
 
 // Pages are kept in the browser's history, so the back and forward buttons
@@ -824,6 +885,7 @@ async function go(view, hist) {
   else if (view.type === 'home') await renderHome();
   else if (view.type === 'remix') await renderRemix();
   else if (view.type === 'spotify') renderSpotify();
+  else if (view.type === 'cleanup') await renderCleanup();
   if (hist?.y && state.view === view) $('main').scrollTop = hist.y;
 }
 
@@ -1777,6 +1839,8 @@ function playIndex(i, autoplay = true, startAt = 0) {
   remixNamed = false; if (state.view.type === 'remix' && paintRemix) paintRemix();  // effects stay on for the next song
   audio.src = srcOf(t);
   applyRemix();
+  applyNorm();
+  if (!xfading) { fadeMul = 1; applyVol(); }
   if (startAt) audio.addEventListener('loadedmetadata', () => { audio.currentTime = startAt; }, { once: true });
   if (autoplay) audio.play().catch(() => {});
   $('nowT').textContent = $('npT').textContent = t.title;
@@ -1821,15 +1885,7 @@ function setMode(mode) {
 }
 $('avTabs').onclick = e => { const m = e.target.closest('button')?.dataset.m; if (m) setMode(m); };
 
-function next(auto = false) {
-  const n = state.queue.length;
-  if (!n) return;
-  let i;
-  if (state.shuffle && n > 1) { do { i = Math.floor(Math.random() * n); } while (i === state.index); }
-  else i = state.index + 1;
-  if (i >= n) { if (auto && !state.repeat) return; i = 0; }
-  playIndex(i);
-}
+function next(auto = false) { const i = pickNext(auto); if (i >= 0) playIndex(i); }
 function prev() {
   if (audio.currentTime > 3 || state.index <= 0) { audio.currentTime = 0; return; }
   playIndex(state.index - 1);
@@ -1866,6 +1922,7 @@ audio.ontimeupdate = () => {
   syncLyrics(t);
   const cur = current();
   if (cur && cur.id && !cur.counted && t > 10) { cur.counted = true; post(`/api/tracks/${cur.id}/played`).catch(() => {}); state.tracksKey = ''; }
+  maybeCrossfade(t, d);
 };
 audio.ondurationchange = () => {
   const d = isFinite(audio.duration) ? audio.duration : 0;
@@ -1915,10 +1972,12 @@ let actx, eqNodes, analyser;
 const npOpen = () => $('np').classList.contains('open');
 function ensureEq() {
   const wantEq = prefs.eqOn && prefs.eq.some(g => g), wantViz = prefs.viz !== 'off' && npOpen() && !!current();
-  if (actx || !(wantEq || wantViz || remixOn() || prefs.volume > 1)) return;
+  if (actx || !(wantEq || wantViz || remixOn() || prefs.volume > 1 || normGain() !== 1)) return;
   try {
     actx = new (window.AudioContext || window.webkitAudioContext)();
     let node = actx.createMediaElementSource(audio);
+    const norm = actx.createGain(); norm.gain.value = normGain();  // even loudness
+    node.connect(norm); node = norm;
     eqNodes = EQ_F.map((f, i) => {
       const n = actx.createBiquadFilter();
       n.type = i === 0 ? 'lowshelf' : i === EQ_F.length - 1 ? 'highshelf' : 'peaking';
@@ -1938,7 +1997,7 @@ function ensureEq() {
     node.connect(bass); bass.connect(pan); pan.connect(analyser); pan.connect(verb); verb.connect(wet); wet.connect(analyser);
     const boost = actx.createGain(); boost.gain.value = Math.max(prefs.volume, 1);
     analyser.connect(boost); boost.connect(actx.destination);
-    fx = { bass, wet, depth, boost };
+    fx = { bass, wet, depth, boost, norm };
     if (remixOn()) applyRemix();
     applyEq();
     if (!audio.paused) actx.resume();
@@ -2306,6 +2365,8 @@ async function renderSettings() {
   </div>
   <div class="box" data-cat="playback"><h3>Listening</h3>
     <div class="field"><div><b>Speed</b><small id="spdLbl"></small></div><input type="range" id="setSpeed" min="0.5" max="2" step="0.05"></div>
+    <div class="field"><div><b>Crossfade</b><small id="xfLbl"></small></div><input type="range" id="setXfade" min="0" max="12" step="1"></div>
+    <div class="field"><div><b>Even loudness</b><small>Quiet and loud songs play at the same level</small></div>${sw('setLoud')}</div>
     <div class="field"><div><b>Sleep timer</b><small>Pause playback automatically</small></div><select id="setSleep"><option value="off">Off</option><option value="15">15 minutes</option><option value="30">30 minutes</option><option value="45">45 minutes</option><option value="60">1 hour</option><option value="end">End of this track</option></select></div>
   </div>
   <div class="box" data-cat="playback"><h3>Keyboard &amp; mouse</h3>
@@ -2328,6 +2389,7 @@ async function renderSettings() {
   <div class="box" data-cat="downloads"><h3>Song names</h3>
     <div class="field"><div><b>Tidy names of new downloads</b><small>Drops clutter such as “(Official Video)”, “| lyrics” and #tags from YouTube titles, and reads “Artist - Title”. Version notes like (Remix) or (Slowed) stay.</small></div>${sw('setClean')}</div>
     <div class="field"><div><b>Songs already in the library</b><small>Tidy them the same way, or put back the names they were downloaded with</small></div><button class="btn ghost" id="restoreNames">Restore originals</button><button class="btn ghost" id="cleanAll">Tidy now</button></div>
+    <div class="field"><div><b>Clean up</b><small>Find duplicates, failed downloads and what uses the disk</small></div><button class="btn ghost" id="openCleanup">Open</button></div>
   </div>
   <div class="box" data-cat="lyrics"><h3>Automatic lyrics</h3>
     <div class="field"><div><b>Download lyrics automatically</b><small>Looks up each new track on LRCLIB</small></div>${sw('setAutoLy')}</div>
@@ -2377,6 +2439,10 @@ async function renderSettings() {
   const spd = $('setSpeed'); spd.value = prefs.speed;
   const spdLbl = () => { $('spdLbl').textContent = (+spd.value).toFixed(2) + '×'; fill(spd); };
   spd.oninput = () => { prefs.speed = +spd.value; applyPrefs(); spdLbl(); }; spdLbl();
+  const xf = $('setXfade'); xf.value = prefs.xfade;
+  const xfLbl = () => { $('xfLbl').textContent = +xf.value ? `Songs blend into each other for ${xf.value} seconds` : 'Off: each song ends before the next starts'; fill(xf); };
+  xf.oninput = () => { prefs.xfade = +xf.value; save('prefs', prefs); xfLbl(); }; xfLbl();
+  $('setLoud').checked = prefs.loud; $('setLoud').onchange = e => { prefs.loud = e.target.checked; save('prefs', prefs); applyNorm(); };
   const preset = $('eqPreset');
   for (const name of [...Object.keys(EQ_PRESETS), 'Custom']) preset.append(new Option(name, name));
   const eqCommit = () => { preset.value = prefs.eqPreset; $('eqOn').checked = prefs.eqOn; ensureEq(); applyPrefs(); };
@@ -2417,6 +2483,7 @@ async function renderSettings() {
   const after = () => { state.tracksKey = ''; lyricsCache.clear(); if (isList(state.view)) reload(true); };
   $('upAll').onclick = async () => { try { await post('/api/upgrade'); state.wasPending = true; toast('Checking which songs can be upgraded…'); } catch (e) { toast(e.message, 'error'); } };
   $('cleanAll').onclick = async () => { try { const r = await post('/api/clean-names'); toast(r.count ? `Tidied ${r.count} name(s)` : 'Every name is already tidy'); after(); } catch (e) { toast(e.message, 'error'); } };
+  $('openCleanup').onclick = () => { closeSettings(); go({ type: 'cleanup' }); };
   $('restoreNames').onclick = async () => { try { const r = await post('/api/restore-names'); toast(r.count ? `Restored ${r.count} name(s)` : 'Nothing to restore'); after(); } catch (e) { toast(e.message, 'error'); } };
   $('retryAll').onclick = async () => { const r = await post('/api/retry-failed'); state.wasPending = true; toast(`Retrying ${r.count} track(s)`); };
   $('lyAll').onclick = async () => { const r = await post('/api/lyrics/all'); toast(r.count ? `Looking up lyrics for ${r.count} track(s) in the background` : 'Every track has already been checked'); };
@@ -2507,8 +2574,335 @@ fxChips($('npFx'));
   paintFx();
 }
 
+// ------------------------------------------------ even loudness + crossfade
+// Even loudness: the server measures every song once and the player turns
+// quiet songs up and loud ones down, so they all play at the same level.
+const normGain = () => { const t = current(); return prefs.loud && t && t.gain ? Math.pow(10, t.gain / 20) : 1; };
+function applyNorm() {
+  const g = normGain();
+  if (g !== 1) ensureEq();
+  if (fx) fx.norm.gain.setTargetAtTime(g, actx.currentTime, 0.04);
+}
+// Crossfade: near the end of a song a second, hidden player takes over its
+// last seconds and fades them out while the next song fades in on the main
+// player (for a video the picture changes when the fade starts). Songs that
+// are only streamed are not crossfaded.
+const tail = new Audio(); tail.preload = 'auto';
+let fadeMul = 1, xfading = false, xTimer = 0, tailFor = null;
+function applyVol() { audio.volume = Math.min(prefs.volume, 1) * fadeMul; }
+function pickNext(auto) {
+  const n = state.queue.length;
+  if (!n) return -1;
+  let i;
+  if (state.shuffle && n > 1) { do { i = Math.floor(Math.random() * n); } while (i === state.index); }
+  else i = state.index + 1;
+  if (i >= n) { if (auto && !state.repeat) return -1; i = 0; }
+  return i;
+}
+function stopTail() {
+  clearInterval(xTimer); xfading = false; tailFor = null;
+  tail.pause(); tail.removeAttribute('src');
+  fadeMul = 1; applyVol();
+}
+function maybeCrossfade(t, d) {
+  const x = prefs.xfade, cur = current();
+  if (!x || xfading || !cur || !cur.id || cur.noFade || !d || d < x * 4 || audio.paused || audio.seeking || state.sleepMode === 'end') return;
+  const left = (d - t) / (audio.playbackRate || 1);
+  if (left > x + 8) return;
+  if (tailFor !== cur) {  // get the helper player ready a few seconds early
+    tailFor = cur; tail.muted = true; tail.src = srcOf(cur); tail.currentTime = Math.max(0, d - x - 1);
+    return;
+  }
+  if (left > x || left < 0.4) return;
+  const i = pickNext(true);
+  if (i < 0 || i === state.index) return;
+  xfading = true;
+  const level = audio.volume * Math.min(1, normGain()), secs = Math.min(x, left);
+  let switched = false;
+  const swap = () => {
+    if (switched) return;
+    switched = true;
+    tail.volume = level; fadeMul = 0; applyVol();
+    playIndex(i);
+    const t0 = performance.now();
+    clearInterval(xTimer);
+    xTimer = setInterval(() => {
+      const p = Math.min(1, (performance.now() - t0) / (secs * 1000));
+      fadeMul = Math.sin(p * Math.PI / 2); applyVol();
+      tail.volume = level * Math.cos(p * Math.PI / 2);
+      if (p >= 1 || tail.ended) stopTail();
+    }, 40);
+  };
+  tail.playbackRate = audio.playbackRate; tail.preservesPitch = audio.preservesPitch;
+  tail.currentTime = audio.currentTime; tail.muted = false; tail.volume = 0;
+  tail.addEventListener('playing', swap, { once: true });
+  tail.play().then(() => setTimeout(swap, 700), () => { switched = true; xfading = false; cur.noFade = true; });
+}
+
+// ----------------------------------------------------------------- clean-up
+// Duplicates, failed downloads, leftover files and what uses the disk.
+async function renderCleanup() {
+  const view = state.view, main = $('main');
+  main.replaceChildren(hero('Library', 'Clean up', 'trash'));
+  state.shown = [];
+  $('heroSub').textContent = 'Looking through your library…';
+  let d;
+  try { d = await api('/api/cleanup'); } catch (e) { if (state.view === view) main.append(el('div', 'empty', e.message)); return; }
+  if (state.view !== view) return;
+  const u = d.usage, again = () => { if (state.view === view) renderCleanup(); };
+  $('heroSub').textContent = `${u.songs} songs · ${bytes(u.audio)} of sound · ${bytes(u.video)} of video`;
+  const box = (title, note) => {
+    const b = el('div', 'box cl-box'), h = el('div', 'cl-h');
+    h.append(el('h3', null, title)); b.append(h);
+    if (note) b.append(el('p', 'cl-note', note));
+    main.append(b);
+    return b;
+  };
+  const act = (b, label, cls, fn) => { const x = el('button', 'btn ' + cls, label); x.onclick = fn; b.querySelector('.cl-h').append(x); return x; };
+  const line = (t, info, extra) => {
+    const r = el('div', 'cl-row'), img = el('img'), m = el('div', 'm');
+    img.loading = 'lazy'; img.alt = ''; setImg(img, t);
+    m.append(el('b', null, t.title), el('small', null, [t.artist, info].filter(Boolean).join(' · ')));
+    r.append(img, m);
+    if (extra) r.append(extra);
+    return r;
+  };
+  const about = t => [t.vfile ? 'with video' : 'sound only', bytes(t.bytes), `${t.plays} play${t.plays === 1 ? '' : 's'}`, t.folders ? `in ${t.folders} folder${t.folders === 1 ? '' : 's'}` : '', t.liked ? 'liked' : ''].filter(Boolean).join(' · ');
+  const merge = g => post('/api/cleanup/merge', { keep: g.keep, remove: g.list.filter(t => t.id !== g.keep).map(t => t.id) });
+
+  // duplicates
+  const groups = d.duplicates.map(list => ({ list, keep: list[0].id }));
+  const extra = groups.reduce((n, g) => n + g.list.length - 1, 0);
+  const dup = box(groups.length ? `Duplicates — ${extra} extra cop${extra === 1 ? 'y' : 'ies'}` : 'Duplicates',
+    groups.length ? 'The same song saved more than once. The copy marked “Keep” stays and takes over the folders, likes and play counts of the others. Click another copy to keep that one instead.' : 'No song is saved twice.');
+  if (groups.length) act(dup, 'Remove all duplicates', '', async () => {
+    if (!await confirmBox('Remove all duplicates?', `${extra} extra cop${extra === 1 ? 'y is' : 'ies are'} deleted. One copy of every song stays, with its folders and likes.`, 'Remove')) return;
+    let n = 0;
+    for (const g of groups) { try { n += (await merge(g)).deleted; } catch (e) { toast(e.message, 'error'); } }
+    toast(`Removed ${n} duplicate${n === 1 ? '' : 's'}`); state.tracksKey = ''; again();
+  });
+  for (const g of groups) {
+    const gb = el('div', 'cl-group');
+    const paint = () => [...gb.querySelectorAll('.cl-row')].forEach((r, i) => { const on = g.list[i].id === g.keep; r.classList.toggle('keep', on); r.querySelector('.cl-tag').textContent = on ? 'Keep' : 'Remove'; });
+    for (const t of g.list) {
+      const r = line(t, about(t), el('span', 'cl-tag'));
+      r.onclick = () => { g.keep = t.id; paint(); };
+      gb.append(r);
+    }
+    const go1 = el('button', 'btn ghost', `Remove ${g.list.length - 1} cop${g.list.length === 2 ? 'y' : 'ies'}`);
+    go1.onclick = async () => { go1.disabled = true; try { await merge(g); toast('Duplicate removed'); state.tracksKey = ''; again(); } catch (e) { go1.disabled = false; toast(e.message, 'error'); } };
+    gb.append(go1); paint(); dup.append(gb);
+  }
+
+  // failed downloads
+  if (d.failed.length) {
+    const f = box(`Failed downloads — ${d.failed.length}`, 'These never finished downloading.');
+    act(f, 'Try again', 'ghost', async () => { try { await post('/api/retry-failed'); state.wasPending = true; toast('Trying those downloads again'); again(); } catch (e) { toast(e.message, 'error'); } });
+    act(f, 'Delete them', '', async () => {
+      if (!await confirmBox('Delete the failed downloads?', `${d.failed.length} entr${d.failed.length === 1 ? 'y is' : 'ies are'} removed from the library.`, 'Delete')) return;
+      for (const t of d.failed) { try { await api(`/api/tracks/${t.id}`, { method: 'DELETE' }); } catch {} }
+      state.tracksKey = ''; again();
+    });
+    for (const t of d.failed) f.append(line(t, t.error || 'failed'));
+  }
+
+  // leftover files
+  if (u.unused_files) {
+    const l = box('Leftover files', `${u.unused_files} file${u.unused_files === 1 ? '' : 's'} in the music folder (${bytes(u.unused)}) belong to no song: remains of interrupted downloads or older versions.`);
+    act(l, 'Delete them', '', async () => { try { const r = await post('/api/cleanup/unused'); toast(`Freed ${bytes(r.bytes)}`); again(); } catch (e) { toast(e.message, 'error'); } });
+  }
+
+  // biggest songs
+  if (d.big.length) {
+    const b = box('Biggest songs', 'What takes the most space.');
+    for (const t of d.big) {
+      const del = el('button', 'icon-btn'); del.innerHTML = svg('trash'); del.title = 'Delete from library';
+      del.onclick = async () => {
+        if (!await confirmBox('Delete from library?', `“${t.title}” and its files are removed.`, 'Delete')) return;
+        try { await api(`/api/tracks/${t.id}`, { method: 'DELETE' }); dropFromPlayer(t.id); state.tracksKey = ''; again(); } catch (e) { toast(e.message, 'error'); }
+      };
+      b.append(line(t, about(t), del));
+    }
+  }
+
+  // folders by size
+  if (d.folders.length) {
+    const f = box('Folders by size'), max = Math.max(1, ...d.folders.map(x => x.bytes));
+    for (const x of d.folders) {
+      const r = el('div', 'cl-bar'), bar = el('i');
+      bar.style.width = Math.max(2, x.bytes / max * 100) + '%';
+      r.append(el('b', null, x.name), el('small', null, `${x.count} song${x.count === 1 ? '' : 's'} · ${bytes(x.bytes)}`), bar);
+      f.append(r);
+    }
+  }
+}
+
+// ----------------------------------------------------------- remote control
+// Every open player stays connected to the server and reports what it is
+// playing, so any of them can control another: play, pause, skip, seek,
+// volume, or send it songs to play.
+const device = { id: null, name: load('deviceName', null) };
+try { device.id = sessionStorage.getItem('deviceId'); } catch {}
+if (!device.id) { device.id = Math.random().toString(36).slice(2, 10) + Date.now().toString(36); try { sessionStorage.setItem('deviceId', device.id); } catch {} }
+if (!device.name) {
+  const u = navigator.userAgent;
+  const os = /Android/.test(u) ? 'Android' : /iPhone|iPad/.test(u) ? 'iPhone' : /Windows/.test(u) ? 'Windows PC' : /Mac/.test(u) ? 'Mac' : /Linux/.test(u) ? 'Linux' : 'Device';
+  const br = /Edg\//.test(u) ? 'Edge' : /Firefox/.test(u) ? 'Firefox' : /Chrome/.test(u) ? 'Chrome' : /Safari/.test(u) ? 'Safari' : 'browser';
+  device.name = `${os} · ${br}`;
+}
+let sock = null, others = [], stateTimer = 0, devBox = null, devTicks = [];
+function wsSend(m) { if (sock && sock.readyState === 1) sock.send(JSON.stringify(m)); }
+function myState() {
+  const t = current();
+  if (!t) return null;
+  const cover = coverUrl(t);
+  return { id: t.id || null, title: t.title, artist: t.artist || '', cover: cover.startsWith('data:') ? null : cover, paused: audio.paused, time: audio.currentTime || 0, duration: isFinite(audio.duration) ? audio.duration : (t.duration || 0), volume: prefs.volume };
+}
+function tellState() { clearTimeout(stateTimer); stateTimer = setTimeout(() => wsSend({ type: 'state', state: myState() }), 150); }
+function wsConnect() {
+  try { sock = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws'); } catch { return; }
+  sock.onopen = () => { wsSend({ type: 'hello', id: device.id, name: device.name }); tellState(); };
+  sock.onmessage = e => {
+    let m; try { m = JSON.parse(e.data); } catch { return; }
+    if (m.type === 'devices') { const now = performance.now(); others = m.devices.filter(x => x.id !== device.id).map(x => ({ ...x, got: now })); paintDevices(); }
+    else if (m.type === 'cmd') runCmd(m.cmd, m.value);
+  };
+  sock.onclose = () => { sock = null; others = []; paintDevices(); setTimeout(wsConnect, 4000); };
+}
+async function runCmd(cmd, v) {
+  if (cmd === 'toggle') toggle();
+  else if (cmd === 'next') next();
+  else if (cmd === 'prev') prev();
+  else if (cmd === 'seek' && isFinite(v)) audio.currentTime = +v;
+  else if (cmd === 'volume' && isFinite(v)) { setVolume(Math.max(0, Math.min(2, +v))); save('prefs', prefs); }
+  else if (cmd === 'playTracks' && v && Array.isArray(v.ids)) {
+    let all = [];
+    try { all = await api('/api/tracks'); } catch { return; }
+    const byId = new Map(all.map(t => [t.id, t])), q = v.ids.map(i => byId.get(i)).filter(t => t && t.status === 'ready');
+    if (!q.length) return;
+    state.queue = q; playIndex(Math.max(0, q.findIndex(t => t.id === v.start)));
+    audio.play().catch(() => toast('Another device sent music here. Click this page once to let it start.', 'info', 9000));
+  }
+}
+const sendCmd = (to, cmd, value) => wsSend({ type: 'cmd', to, cmd, value });
+// "Play on <device>" entries for a song's menu
+function deviceItems(t) {
+  return others.map(d => ({ icon: 'devices', label: `Play on ${d.name}`, fn: () => {
+    const ids = state.shown.filter(x => x.id && x.status === 'ready').map(x => x.id).slice(0, 300);
+    sendCmd(d.id, 'playTracks', { ids: ids.includes(t.id) ? ids : [t.id], start: t.id });
+    toast(`Playing “${t.title}” on ${d.name}`);
+  } }));
+}
+function openDevices() {
+  const wrap = el('div', 'modal dlg-wrap'), box = el('div', 'dlg dev-dlg');
+  box.append(el('h3', null, 'Devices'));
+  const me = el('label', null, 'This device is called'), name = el('input');
+  name.type = 'text'; name.value = device.name; name.maxLength = 40; name.autocomplete = 'off';
+  name.onchange = () => { device.name = name.value.trim() || device.name; name.value = device.name; save('deviceName', device.name); wsSend({ type: 'name', name: device.name }); };
+  me.append(name);
+  const list = el('div', 'dev-list'), row = el('div', 'dlg-act'), ok = el('button', 'btn', 'Done');
+  row.append(ok); box.append(me, list, row); wrap.append(box); document.body.append(wrap);
+  devBox = list;
+  const timer = setInterval(() => devTicks.forEach(f => f()), 1000);
+  const done = () => { clearInterval(timer); devBox = null; devTicks = []; wrap.remove(); };
+  ok.onclick = done;
+  wrap.onpointerdown = e => { if (e.target === wrap) done(); };
+  wrap.onkeydown = e => { e.stopPropagation(); if (e.key === 'Escape') done(); };
+  paintDevices();
+  ok.focus();
+}
+function paintDevices() {
+  for (const id of ['devBtn', 'npDev']) { const b = $(id); b.classList.toggle('on', others.length > 0); b.title = others.length ? `Devices: ${others.length} other device${others.length === 1 ? '' : 's'} open` : 'Devices: control another device'; }
+  if (!devBox || devBox.dataset.busy) return;
+  devBox.replaceChildren(); devTicks = [];
+  if (!others.length) return devBox.append(el('p', 'cl-note', sock ? 'No other device has Sonara open right now. Open this same address on a phone, TV or another computer and it shows up here, ready to be controlled.' : 'Not connected to the server. Trying again…'));
+  const hold = inp => { inp.addEventListener('pointerdown', () => { devBox.dataset.busy = '1'; }); const free = () => { delete devBox.dataset.busy; }; inp.addEventListener('change', free); inp.addEventListener('pointerup', () => setTimeout(free, 300)); };
+  for (const d of others) {
+    const s = d.state, card = el('div', 'dev-card'), head = el('div', 'dev-head');
+    head.innerHTML = svg('devices'); head.append(el('b', null, d.name));
+    card.append(head);
+    if (!s) { card.append(el('p', 'cl-note', 'Nothing playing there. Right-click a song here and choose “Play on ' + d.name + '”.')); devBox.append(card); continue; }
+    const now = el('div', 'cl-row'), img = el('img'), m = el('div', 'm');
+    img.alt = ''; img.src = s.cover || placeholder({ title: s.title, id: s.id }); img.onerror = () => { img.onerror = null; img.src = placeholder({ title: s.title, id: s.id }); };
+    m.append(el('b', null, s.title), el('small', null, s.artist || ''));
+    now.append(img, m);
+    const ctl = el('div', 'dev-ctl');
+    for (const [ico, cmd, cls] of [['prev', 'prev', 'icon-btn'], [s.paused ? 'play' : 'pause', 'toggle', 'play'], ['next', 'next', 'icon-btn']]) {
+      const b = el('button', cls); b.innerHTML = svg(ico); b.onclick = () => sendCmd(d.id, cmd); ctl.append(b);
+    }
+    const pos = () => Math.min(s.duration || 0, s.time + (s.paused ? 0 : (performance.now() - d.got) / 1000));
+    const seek = el('div', 'seek'), cur = el('span', null, fmt(pos())), bar = el('input'), dur = el('span', null, fmt(s.duration));
+    bar.type = 'range'; bar.min = 0; bar.max = s.duration || 1; bar.step = 0.1; bar.value = pos(); fill(bar);
+    bar.oninput = () => { cur.textContent = fmt(bar.value); fill(bar); };
+    bar.onchange = () => sendCmd(d.id, 'seek', +bar.value);
+    hold(bar);
+    seek.append(cur, bar, dur);
+    devTicks.push(() => { if (devBox && !devBox.dataset.busy) { bar.value = pos(); fill(bar); cur.textContent = fmt(pos()); } });
+    const vol = el('div', 'dev-vol'), vr = el('input'), vp = el('span', null, Math.round((s.volume ?? 1) * 100) + '%');
+    vol.innerHTML = svg('volume');
+    vr.type = 'range'; vr.min = 0; vr.max = 2; vr.step = 0.01; vr.value = s.volume ?? 1; fill(vr);
+    vr.oninput = () => { vp.textContent = Math.round(vr.value * 100) + '%'; fill(vr); sendCmd(d.id, 'volume', +vr.value); };
+    hold(vr);
+    vol.append(vr, vp);
+    card.append(now, ctl, seek, vol);
+    devBox.append(card);
+  }
+}
+for (const k of ['play', 'pause', 'seeked', 'loadedmetadata', 'ended', 'emptied']) audio.addEventListener(k, tellState);
+setInterval(() => { if (!audio.paused) tellState(); }, 5000);
+$('devBtn').onclick = $('npDev').onclick = openDevices;
+
+// ----------------------------------------------------------------- profiles
+// One library for the whole house; each profile keeps its own likes,
+// history, most played and folders. The choice is remembered per browser.
+async function loadProfiles() {
+  try {
+    const r = await api('/api/profiles');
+    profile.list = r.profiles;
+    if (!r.profiles.some(p => p.id === profile.id)) { profile.id = 1; save('profile', 1); }
+  } catch {}
+  paintProfile();
+}
+const profileName = () => (profile.list.find(p => p.id === profile.id) || { name: 'Me' }).name;
+function paintProfile() {
+  const n = profileName();
+  $('profAv').textContent = (n.trim()[0] || '?').toUpperCase();
+  $('profAv').style.background = grad(n);
+  $('profName').textContent = n;
+}
+async function useProfile(id, quiet) {
+  profile.id = id; save('profile', id); paintProfile();
+  state.tracksKey = ''; state.search = null;
+  await loadPlaylists();
+  await go({ type: 'home' });
+  if (!quiet) toast(`Now listening as ${profileName()}`);
+}
+$('profBtn').onclick = e => {
+  const items = profile.list.map(p => ({ icon: p.id === profile.id ? 'check' : 'person', label: p.name, fn: () => { if (p.id !== profile.id) useProfile(p.id); } }));
+  items.push({ icon: 'plus', label: 'Add a profile…', fn: async () => {
+    const r = await dialog({ title: 'New profile', text: 'A profile has its own likes, history and folders. Everyone shares the same songs.', fields: [{ label: 'Name', placeholder: 'For example: Sara' }], ok: 'Create' });
+    if (!r || !r[0]) return;
+    try { const p = await post('/api/profiles', { name: r[0] }); await loadProfiles(); useProfile(p.id); } catch (err) { toast(err.message, 'error'); }
+  } });
+  items.push({ icon: 'edit', label: `Rename “${profileName()}”`, fn: async () => {
+    const r = await dialog({ title: 'Rename profile', fields: [{ label: 'Name', value: profileName() }] });
+    if (!r || !r[0]) return;
+    try { await api('/api/profiles/' + profile.id, { method: 'PATCH', body: { name: r[0] } }); await loadProfiles(); } catch (err) { toast(err.message, 'error'); }
+  } });
+  if (profile.id !== 1) items.push({ icon: 'trash', label: `Delete “${profileName()}”`, danger: true, fn: async () => {
+    if (!await confirmBox('Delete this profile?', `“${profileName()}” loses its likes, history and folders. The songs stay in the library.`, 'Delete')) return;
+    try { await api('/api/profiles/' + profile.id, { method: 'DELETE' }); profile.id = 1; await loadProfiles(); useProfile(1); } catch (err) { toast(err.message, 'error'); }
+  } });
+  openMenu(e.currentTarget, items, 'Who is listening?');
+};
+
 // ------------------------------------------------------------------ init
 applyPrefs();
+navBtns().forEach(b => { b.oncontextmenu = e => { e.preventDefault(); navMenu(b, at(e)); }; });
+$('navMore').onclick = e => moreMenu(e.currentTarget);
+$('navMore').oncontextmenu = e => { e.preventDefault(); navDialog(); };
+document.querySelector('.side .logo').oncontextmenu = e => { e.preventDefault(); navDialog(); };
+applyNav();
 history.replaceState(null, '');  // a reload starts a fresh trail of pages
 $('backBtn').onclick = () => history.back();
 $('fwdBtn').onclick = () => history.forward();
@@ -2516,7 +2910,9 @@ $$('input[type=range]').forEach(fill);
 if (wide() && prefs.panel) openNp();
 (async () => {
   try { const a = await api('/api/auth'); if (a.required && !a.authed) return showLogin(); } catch {}
+  await loadProfiles();
   await go({ type: 'home' });
   try { localStorage.removeItem('last'); } catch {}  // nothing is remembered between visits
+  wsConnect();
   poll();
 })();
