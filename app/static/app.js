@@ -182,6 +182,9 @@ function setVolume(v) {
   const r = document.getElementById('vol');
   r.value = v; fill(r); r.classList.toggle('boost', v > 1);
   r.title = `Volume ${Math.round(v * 100)}%` + (v > 1 ? ' — louder than the original' : '');
+  const pct = document.getElementById('volPct'), back = document.getElementById('volReset');
+  pct.textContent = Math.round(v * 100) + '%'; pct.classList.toggle('boost', v > 1);
+  back.hidden = v === 1;
 }
 const state = {
   view: { type: 'library' }, tracks: [], shown: [], tracksKey: '', filter: '',
@@ -790,7 +793,27 @@ function setActive() {
   $$('#pls .nav').forEach(b => b.classList.toggle('active', v.type === 'playlist' && +b.dataset.id === v.id));
 }
 
-async function go(view) {
+// Pages are kept in the browser's history, so the back and forward buttons
+// at the top, the browser's own Back, a mouse back button and the back
+// gesture on a phone all return to the page before.
+let navI = 0, navMax = 0;
+function paintNav() { $('backBtn').disabled = navI <= 0; $('fwdBtn').disabled = navI >= navMax; }
+window.addEventListener('popstate', e => {
+  if (!e.state?.view) return;
+  navI = e.state.i; navMax = Math.max(navMax, navI);
+  closeMenu();
+  go(e.state.view, e.state);
+});
+async function go(view, hist) {
+  if (!hist) {
+    const at = history.state;
+    if (!at?.view) history.replaceState({ view, i: navI }, '');  // the first page
+    else if (JSON.stringify(at.view) !== JSON.stringify(view)) {
+      history.replaceState({ ...at, y: $('main').scrollTop }, '');  // remember how far this page was scrolled
+      history.pushState({ view, i: ++navI }, ''); navMax = navI;
+    }
+  }
+  paintNav();
   state.view = view; state.filter = ''; state.tracksKey = '';
   setPicked([]);
   setActive();
@@ -801,6 +824,7 @@ async function go(view) {
   else if (view.type === 'home') await renderHome();
   else if (view.type === 'remix') await renderRemix();
   else if (view.type === 'spotify') renderSpotify();
+  if (hist?.y && state.view === view) $('main').scrollTop = hist.y;
 }
 
 function hero(kind, title, icon, bg) {
@@ -950,11 +974,42 @@ async function loadPlaylists() {
     b.innerHTML = svg('folder'); b.append(el('span', null, p.name), el('small', null, p.count));
     b.onclick = () => go({ type: 'playlist', id: p.id, name: p.name, source: p.source });
     b.onpointerdown = e => cardDrag(e, b, box, ".nav", true);
+    b.oncontextmenu = e => { e.preventDefault(); folderMenu(p, at(e)); };
     if (state.pulse === p.id) b.classList.add('got');  // songs were just dropped in
     box.append(b);
   }
   state.pulse = null;
   setActive();
+}
+// Right-click menu of a folder, in the sidebar and on the Folders page.
+function folderMenu(p, anchor) {
+  const here = () => state.view.type === 'playlist' && state.view.id === p.id;
+  const redraw = async () => { await loadPlaylists(); if (state.view.type === 'folders') renderFolders(); };
+  const play = async mix => {
+    let list = [];
+    try { list = (await api('/api/tracks?playlist=' + p.id)).filter(t => t.status === 'ready'); } catch (e) { return toast(e.message, 'error'); }
+    if (!list.length) return toast('This folder has no songs to play yet');
+    if (mix) list.sort(() => Math.random() - 0.5);
+    state.queue = list; playIndex(0);
+  };
+  openMenu(anchor, [
+    { icon: 'folder', label: 'Open', fn: () => go({ type: 'playlist', id: p.id, name: p.name, source: p.source }) },
+    { icon: 'play', label: 'Play', fn: () => play(false) },
+    { icon: 'shuffle', label: 'Shuffle', fn: () => play(true) },
+    { icon: 'edit', label: 'Rename', fn: async () => {
+      const r = await dialog({ title: 'Rename folder', fields: [{ label: 'Name', value: p.name }] }); const n = r && r[0];
+      if (!n || n === p.name) return;
+      try { await api(`/api/playlists/${p.id}`, { method: 'PATCH', body: { name: n } }); } catch (e) { return toast(e.message, 'error'); }
+      await redraw();
+      if (here()) { state.view.name = n; renderTrackShell(); reload(true); }
+    } },
+    { icon: 'trash', label: 'Delete folder (keeps songs)', danger: true, fn: async () => {
+      if (!await confirmBox('Delete folder?', `“${p.name}” is removed. Its songs stay in the library.`, 'Delete')) return;
+      try { await api(`/api/playlists/${p.id}`, { method: 'DELETE' }); } catch (e) { return toast(e.message, 'error'); }
+      toast(`Deleted the folder “${p.name}”`);
+      if (here()) go({ type: 'folders' }); else redraw();
+    } },
+  ], p.name);
 }
 // True while a folder is being dragged (sidebar or Folders page).
 let plDrag = false;
@@ -984,6 +1039,7 @@ function renderFolders() {
     c.onclick = () => go({ type: 'playlist', id: p.id, name: p.name, source: p.source });
     c.dataset.id = p.id; c.title = 'Drag to move this folder';
     c.onpointerdown = e => cardDrag(e, c, grid);
+    c.oncontextmenu = e => { e.preventDefault(); folderMenu(p, at(e)); };
     grid.append(c);
   });
   main.append(grid);
@@ -1819,6 +1875,7 @@ $$('.js-seek').forEach(s => {
   s.onchange = () => { audio.currentTime = s.value; seeking = false; };
 });
 $('vol').oninput = () => { setVolume(+$('vol').value); save('prefs', prefs); };
+$('volReset').onclick = () => { setVolume(1); save('prefs', prefs); };
 $$('.js-play').forEach(b => { b.onclick = toggle; });
 $$('.js-next').forEach(b => { b.onclick = () => next(); });
 $$('.js-prev').forEach(b => { b.onclick = prev; });
@@ -2450,6 +2507,9 @@ fxChips($('npFx'));
 
 // ------------------------------------------------------------------ init
 applyPrefs();
+history.replaceState(null, '');  // a reload starts a fresh trail of pages
+$('backBtn').onclick = () => history.back();
+$('fwdBtn').onclick = () => history.forward();
 $$('input[type=range]').forEach(fill);
 if (wide() && prefs.panel) openNp();
 (async () => {

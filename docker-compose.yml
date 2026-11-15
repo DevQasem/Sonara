@@ -1,7 +1,7 @@
 services:
   music:
     build: .
-    container_name: homelab-music
+    container_name: sonara
     restart: unless-stopped
     ports:
       - "8337:8000"          # open http://<homelab-ip>:8337
@@ -30,7 +30,7 @@ services:
     build:
       context: .
       dockerfile: ai/Dockerfile
-    container_name: homelab-music-ai
+    container_name: sonara-ai
     restart: unless-stopped
     volumes:
       - ./data:/data         # same folder as the player: songs in, results out
@@ -51,7 +51,7 @@ services:
     build:
       context: .
       dockerfile: ai/songs.Dockerfile
-    container_name: homelab-music-songs
+    container_name: sonara-songs
     restart: unless-stopped
     volumes:
       - ./data:/data

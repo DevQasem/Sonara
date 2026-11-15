@@ -1,4 +1,4 @@
-"""Homelab Music - AI add-on.
+"""Sonara - AI add-on.
 
 A small service the player calls for the two jobs that need a graphics card:
 
@@ -18,7 +18,7 @@ import torch
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI(title="Homelab Music AI")
+app = FastAPI(title="Sonara AI")
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 MUSICGEN = os.environ.get("MUSICGEN_MODEL", "facebook/musicgen-small")
 DATA = os.path.realpath(os.environ.get("DATA_DIR", "/data"))

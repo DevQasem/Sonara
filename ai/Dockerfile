@@ -1,4 +1,4 @@
-# Optional AI add-on for Homelab Music (needs an NVIDIA graphics card).
+# Optional AI add-on for Sonara (needs an NVIDIA graphics card).
 # Start it together with the player:  docker compose --profile ai up -d --build
 FROM python:3.12-slim
 

@@ -1,4 +1,4 @@
-# Homelab Music
+# Sonara
 
 Self-hosted web music player for your LAN. Works on desktop and phones.
 
@@ -90,8 +90,8 @@ curl -fsSL https://get.docker.com | sudo sh
 sudo usermod -aG docker $USER && newgrp docker
 
 # 2. Get the project
-git clone https://github.com/DevQasem/homelab-music.git homelab-music
-cd homelab-music
+git clone https://github.com/DevQasem/sonara.git sonara
+cd sonara
 
 # 3. Optional: set a password before the first start
 cp .env.example .env && nano .env
@@ -118,17 +118,17 @@ and then shows up on the dashboard.
 
    ```bash
    sudo mkdir -p /DATA/AppData && cd /DATA/AppData
-   sudo git clone https://github.com/DevQasem/homelab-music.git homelab-music
-   cd homelab-music
+   sudo git clone https://github.com/DevQasem/sonara.git sonara
+   cd sonara
    sudo docker compose up -d --build
    ```
 
-3. Open `http://<casaos-ip>:8337`. The container `homelab-music` also
+3. Open `http://<casaos-ip>:8337`. The container `sonara` also
    appears among the apps on the dashboard; if it is marked as an app CasaOS
    did not install, use its menu to import it, then set the Web UI port to
    `8337` in its settings so the tile opens the player.
 
-Your library is in `/DATA/AppData/homelab-music/data`, which is also visible
+Your library is in `/DATA/AppData/sonara/data`, which is also visible
 in the CasaOS Files app.
 
 ### Windows
@@ -139,8 +139,8 @@ in the CasaOS Files app.
 2. In PowerShell:
 
    ```powershell
-   git clone https://github.com/DevQasem/homelab-music.git homelab-music
-   cd homelab-music
+   git clone https://github.com/DevQasem/sonara.git sonara
+   cd sonara
    docker compose up -d --build
    ```
 

@@ -1,4 +1,4 @@
-"""Homelab Music - self-hosted player.
+"""Sonara - self-hosted player.
 
 Sources: YouTube (search / links), Spotify links (resolved to YouTube audio),
 and files uploaded from the user's device. Extras: folders, lyrics (LRCLIB),
@@ -57,7 +57,7 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 TRACK_COLS = ("id,title,artist,duration,source,video_id,status,error,"
               "lyrics_state,kind,liked,plays")
 
-app = FastAPI(title="Homelab Music")
+app = FastAPI(title="Sonara")
 jobs: "queue.Queue[tuple[str, object]]" = queue.Queue()
 events: deque = deque(maxlen=30)
 _event_id = 0
@@ -515,7 +515,7 @@ def spotify_fetch(kind: str, sid: str):
 def lrclib(path: str, **params):
     url = f"https://lrclib.net/api/{path}?{urllib.parse.urlencode(params)}"
     try:
-        return json.loads(http(url, {"User-Agent": "HomelabMusic/1.0"}))
+        return json.loads(http(url, {"User-Agent": "Sonara/1.0"}))
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return None
@@ -1850,7 +1850,7 @@ def _musicbrainz_artist(name: str) -> dict:
     q = urllib.parse.quote(f'artist:"{name}"')
     j = json.loads(http(
         f"https://musicbrainz.org/ws/2/artist/?query={q}&fmt=json&limit=3",
-        {"User-Agent": "HomelabMusic/1.0 (self-hosted music player)"}))
+        {"User-Agent": "Sonara/1.0 (self-hosted music player)"}))
     for a in j.get("artists") or []:
         if (a.get("score") or 0) >= 90 and _norm(a.get("name")) == _norm(name):
             tags = sorted(a.get("tags") or [],
