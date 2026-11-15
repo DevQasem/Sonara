@@ -4,6 +4,7 @@ A small service the player calls for the two jobs that need a graphics card:
 
   /separate  split a song into vocals and instrumental (Demucs)
   /generate  make a short piece of music from a text description (MusicGen)
+  /transcribe  write down the sung words with their times (Whisper)
 
 Only one model is kept in memory at a time, so it fits a 6 GB card. Files are
 exchanged through the /data folder that both containers mount."""
@@ -263,3 +264,89 @@ def generate(req: GenReq):
         rate = model.config.audio_encoder.sampling_rate
         write_wav(out, audio[0].float().cpu().numpy(), rate)
         return {"out": out, "seconds": seconds, "peak_vram_mb": vram_peak()}
+
+
+# ------------------------------------------------------ lyrics from the sound
+# The singing is separated from the music first, then a speech model writes
+# down the words with the time each line starts.
+WHISPER = os.environ.get("WHISPER_MODEL", "openai/whisper-large-v3-turbo")
+JUNK_LINE = ("subtitles by", "subscribe", "thanks for watching", "amara.org",
+             "ترجمة", "اشترك", "altyazı", "www.")
+
+
+def load_whisper():
+    from transformers import pipeline
+    return pipeline("automatic-speech-recognition", model=WHISPER,
+                    torch_dtype=torch.float16 if DEV == "cuda" else torch.float32,
+                    device=0 if DEV == "cuda" else -1)
+
+
+class LyricsReq(BaseModel):
+    src: str             # audio file inside /data
+    language: str = ""   # "" = detect
+
+
+@app.post("/transcribe")
+def transcribe(req: LyricsReq):
+    import librosa
+    src = inside_data(req.src)
+    with _lock:
+        if DEV == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+        vocals, _, rate = split_song(src)
+        voice = librosa.resample(vocals.mean(0), orig_sr=rate, target_sr=16000)
+        pipe = use("whisper", load_whisper)
+        opts = {"task": "transcribe"}
+        if req.language:
+            opts["language"] = req.language
+        audio = {"raw": voice, "sampling_rate": 16000}
+        try:    # a time for every word, so the lines can be cut where the singer pauses
+            res = pipe(dict(audio), chunk_length_s=30, return_timestamps="word",
+                       generate_kwargs=opts)
+            segs = group_words(res.get("chunks") or [])
+        except Exception:
+            res = pipe(dict(audio), chunk_length_s=30, return_timestamps=True,
+                       generate_kwargs=opts)
+            segs = [((c.get("timestamp") or (None, None))[0],
+                     (c.get("timestamp") or (None, None))[1],
+                     (c.get("text") or "").strip())
+                    for c in res.get("chunks") or []]
+        lines, last, repeats = [], "", 0
+        for start, end, text in segs:
+            if not text or start is None:
+                continue
+            end = end if end is not None else start + 4
+            part = voice[int(start * 16000):int(end * 16000)]
+            # a speech model invents words over silence: skip quiet stretches,
+            # its usual inventions, and a line said over and over
+            if part.size == 0 or float(np.sqrt(np.mean(part ** 2))) < 0.012:
+                continue
+            low = text.lower()
+            repeats = repeats + 1 if low == last else 0
+            if any(j in low for j in JUNK_LINE) or repeats >= 2:
+                continue
+            last = low
+            lines.append({"start": round(float(start), 2),
+                          "end": round(float(end), 2), "text": text})
+        return {"lines": lines, "peak_vram_mb": vram_peak()}
+
+
+def group_words(words: list) -> list:
+    """Words with their times -> lines: a new line after a pause, or when
+    the line is getting long."""
+    out, cur = [], []
+    for w in words:
+        text = (w.get("text") or "").strip()
+        start, end = w.get("timestamp") or (None, None)
+        if not text or start is None:
+            continue
+        end = end if end is not None else start + 0.4
+        if cur and (start - cur[-1][1] > 0.65 or len(cur) >= 9
+                    or end - cur[0][0] > 7):
+            out.append((cur[0][0], cur[-1][1], " ".join(x[2] for x in cur)))
+            cur = []
+        cur.append((start, end, text))
+    if cur:
+        out.append((cur[0][0], cur[-1][1], " ".join(x[2] for x in cur)))
+    return out
+

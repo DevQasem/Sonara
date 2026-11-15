@@ -100,6 +100,14 @@ def init_db():
         CREATE TABLE IF NOT EXISTS artists(
             name TEXT PRIMARY KEY, data TEXT, fetched REAL);
         CREATE TABLE IF NOT EXISTS profiles(id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE IF NOT EXISTS profile_keys(
+            token TEXT PRIMARY KEY, profile_id INTEGER);
+        CREATE TABLE IF NOT EXISTS activity(
+            id INTEGER PRIMARY KEY, at REAL, profile_id INTEGER, action TEXT,
+            text TEXT);
+        CREATE TABLE IF NOT EXISTS trash(
+            id INTEGER PRIMARY KEY, at REAL, profile_id INTEGER, kind TEXT,
+            name TEXT, data TEXT);
         CREATE TABLE IF NOT EXISTS profile_tracks(
             profile_id INTEGER, track_id INTEGER, liked INTEGER DEFAULT 0,
             plays INTEGER DEFAULT 0, last_played REAL,
@@ -112,6 +120,11 @@ def init_db():
                                 con.execute("PRAGMA table_info(playlists)")}:
             con.execute("ALTER TABLE playlists ADD COLUMN profile_id INTEGER "
                         "DEFAULT 1")
+        pcols = {r["name"] for r in con.execute("PRAGMA table_info(profiles)")}
+        if "pin" not in pcols:
+            con.execute("ALTER TABLE profiles ADD COLUMN pin TEXT")
+        if "kid" not in pcols:
+            con.execute("ALTER TABLE profiles ADD COLUMN kid INTEGER DEFAULT 0")
         cols = {r["name"] for r in con.execute("PRAGMA table_info(tracks)")}
         for name, ddl in (("file", "TEXT"), ("lyrics", "TEXT"),
                           ("lyrics_state", "TEXT"),
@@ -253,29 +266,63 @@ def set_cookie(resp, token: str):
 # Which profile a request is for (likes, history and folders are per
 # profile). The page sends it with every request; without it, the first.
 _profile: contextvars.ContextVar = contextvars.ContextVar("profile", default=1)
-_profile_ids = {1}
+_profile_key: contextvars.ContextVar = contextvars.ContextVar("pkey", default="")
+_profile_info: dict = {1: {"pin": None, "kid": False}}
+_profile_keys: dict = {}   # key given after a correct PIN -> profile id
 
 
-def header_profile(scope) -> int:
+def header_profile(scope):
+    """(profile id, whether the page named one, its PIN key)"""
+    pid, sent, key = 1, False, ""
     for k, v in scope.get("headers") or []:
         if k == b"x-profile":
             try:
-                return int(v)
+                pid, sent = int(v), True
             except ValueError:
-                return 1
-    return 1
+                pass
+        elif k == b"x-profile-key":
+            key = v.decode("latin-1")
+    if pid not in _profile_info:
+        pid = 1
+    return pid, sent, key
 
 
 def profile_id() -> int:
     p = _profile.get()
-    return p if p in _profile_ids else 1
+    return p if p in _profile_info else 1
 
 
 def load_profiles():
     with db() as con:
-        _profile_ids.clear()
-        _profile_ids.update(r["id"] for r in con.execute(
-            "SELECT id FROM profiles"))
+        info = {r["id"]: {"pin": r["pin"], "kid": bool(r["kid"])}
+                for r in con.execute("SELECT id,pin,kid FROM profiles")}
+        keys = {r["token"]: r["profile_id"] for r in con.execute(
+            "SELECT token,profile_id FROM profile_keys")}
+    _profile_info.clear()
+    _profile_info.update(info or {1: {"pin": None, "kid": False}})
+    _profile_keys.clear()
+    _profile_keys.update(keys)
+
+
+# What a listen-only (kids) profile may still change: its own likes, play
+# counts and folders.
+KID_OK = re.compile(r"^/api/(tracks/\d+/(like|played)|playlists(/.*)?|"
+                    r"login|logout|profiles/\d+/unlock)$")
+
+
+def profile_block(path: str, method: str, pid: int, sent: bool, key: str):
+    """(status, message) when the profile may not make this request."""
+    info = _profile_info.get(pid)
+    if not info or not path.startswith("/api/") or path in OPEN_PATHS:
+        return None
+    write = method not in ("GET", "HEAD", "OPTIONS")
+    if (info["pin"] and _profile_keys.get(key) != pid
+            and not path.startswith("/api/profiles") and (write or sent)):
+        return 423, "This profile is locked with a PIN"
+    if info["kid"] and write and not KID_OK.match(path):
+        return 403, ("This profile can only listen. Downloading, deleting "
+                     "and changing things is switched off for it.")
+    return None
 
 
 class AuthMiddleware:
@@ -285,10 +332,16 @@ class AuthMiddleware:
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
             path = scope["path"]
-            _profile.set(header_profile(scope))
+            pid, sent, key = header_profile(scope)
+            _profile.set(pid)
+            _profile_key.set(key)
             if (path.startswith(("/api/", "/media/")) and path not in OPEN_PATHS
                     and not is_authed(scope)):
                 resp = JSONResponse({"detail": "Login required"}, 401)
+                return await resp(scope, receive, send)
+            block = profile_block(path, scope["method"], pid, sent, key)
+            if block:
+                resp = JSONResponse({"detail": block[1]}, block[0])
                 return await resp(scope, receive, send)
 
             async def hardened(message):
@@ -1278,6 +1331,7 @@ def spotify_add(req: SpotifyAdd):
         raise HTTPException(400, "Bad track id")
     tid = add_track(f"sp:{req.id}", req.title, req.artist, req.duration,
                     "spotify")
+    log_act("add", f"Downloaded “{req.title}” (Spotify)")
     if req.playlist:
         with db() as con:
             if con.execute("SELECT 1 FROM playlists WHERE id=?",
@@ -1320,6 +1374,7 @@ def add(req: AddReq):
     kind = "video" if req.kind == "video" else "audio"
     tid = add_track(yt_ext(req.video_id, kind), req.title, req.artist,
                     req.duration, "youtube", req.video_id, kind)
+    log_act("add", f"Downloaded “{req.title}”")
     if req.playlist:
         with db() as con:
             if con.execute("SELECT 1 FROM playlists WHERE id=?",
@@ -1336,6 +1391,7 @@ def import_url(req: ImportReq):
         host == h or host.endswith("." + h) for h in YOUTUBE_HOSTS)
     if not ok:
         raise HTTPException(400, "Only YouTube and Spotify links are supported")
+    log_act("add", f"Imported a link: {url[:200]}")
     jobs.put(("import", (url, "video" if req.kind == "video" else "audio",
                          tuple(req.skip), req.playlist, req.nofolder,
                          profile_id())))
@@ -1633,15 +1689,29 @@ def run_song(job: dict, tmp: Path):
     if job.get("seed"):
         body["use_random_seed"] = False
     row = src = None
-    if job["kind"] in ("cover", "repaint"):
+    if job["kind"] in ("cover", "repaint", "extend"):
         with db() as con:
             row = con.execute("SELECT * FROM tracks WHERE id=? AND "
                               "status='ready'", (job["track_id"],)).fetchone()
         if not row or not row["file"]:
             raise RuntimeError("That song is no longer in the library")
         src = Path(song_source(row, tmp))
-        body["task_type"] = job["kind"]
-        if job["kind"] == "cover":
+        body["task_type"] = "repaint" if job["kind"] == "extend" else job["kind"]
+        if job["kind"] == "extend":
+            # Add silence after the end (or before the start) and have the
+            # engine write music into exactly that stretch.
+            secs = job["seconds"]
+            length = round((src.stat().st_size - 44) / 192000, 2)  # 48 kHz 16-bit stereo
+            padded = tmp / "padded.wav"
+            pad = (f"adelay={secs * 1000}:all=1" if job["where"] == "start"
+                   else f"apad=pad_dur={secs}")
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(src),
+                            "-af", pad, str(padded)], check=True, timeout=600)
+            src = padded
+            start = 0 if job["where"] == "start" else length
+            body.update(repainting_start=start, repainting_end=start + secs,
+                        audio_duration=length + secs)
+        elif job["kind"] == "cover":
             body["audio_cover_strength"] = job["strength"]
         else:
             body.update(repainting_start=job["start"],
@@ -1667,8 +1737,12 @@ def _run_ai(job: dict):
     job["state"] = "working"
     tmp = AI_TMP / job["id"]
     try:
-        if job["kind"] in ("song", "cover", "repaint"):
+        if job["kind"] in ("song", "cover", "repaint", "extend"):
             run_song(job, tmp)
+            job["state"] = "done"
+            return
+        if job["kind"] == "lyrics":
+            run_lyrics(job)
             job["state"] = "done"
             return
         if job["kind"] == "split":
@@ -2088,24 +2162,43 @@ def retry_failed():
 
 
 @app.delete("/api/tracks/{tid}")
-def delete_track(tid: int):
+def delete_track(tid: int, forever: bool = False):
+    """A finished song goes to the recycle bin (its files stay on disk until
+    the bin is emptied); an unfinished download is simply removed."""
     with db() as con:
-        row = con.execute("SELECT file,video_file,status FROM tracks WHERE "
-                          "id=?", (tid,)).fetchone()
+        row = con.execute("SELECT * FROM tracks WHERE id=?", (tid,)).fetchone()
         if not row:
             raise HTTPException(404)
         if row["status"] in ("queued", "downloading"):
             cancelled.add(tid)  # stops the download if it is running
+        binned = row["status"] == "ready" and not forever
+        trash_id = None
+        if binned:
+            data = {"row": dict(row),
+                    "folders": [[m["playlist_id"], m["position"]] for m in
+                                con.execute("SELECT playlist_id,position FROM "
+                                            "playlist_tracks WHERE track_id=?",
+                                            (tid,))],
+                    "profiles": [[p["profile_id"], p["liked"], p["plays"],
+                                  p["last_played"]] for p in con.execute(
+                        "SELECT * FROM profile_tracks WHERE track_id=?",
+                        (tid,))]}
+            trash_id = con.execute(
+                "INSERT INTO trash(at,profile_id,kind,name,data) VALUES"
+                "(?,?,?,?,?)", (time.time(), profile_id(), "song",
+                                row["title"], json.dumps(data))).lastrowid
         con.execute("DELETE FROM tracks WHERE id=?", (tid,))
         con.execute("DELETE FROM playlist_tracks WHERE track_id=?", (tid,))
         con.execute("DELETE FROM profile_tracks WHERE track_id=?", (tid,))
-        names = {n for n in (row["file"], row["video_file"]) if n}
-        keep = {n for n in names if con.execute(
-            "SELECT 1 FROM tracks WHERE file=? OR video_file=?", (n, n)).fetchone()}
-    for n in names - keep:
-        (MUSIC / Path(n).name).unlink(missing_ok=True)
-    (COVERS / f"{tid}.jpg").unlink(missing_ok=True)
-    return {"ok": True}
+        if not binned:
+            drop_song_files([row["file"], row["video_file"]], con)
+    cover = COVERS / f"{tid}.jpg"
+    if binned and cover.exists():
+        cover.replace(COVERS / f"trash_{trash_id}.jpg")
+    else:
+        cover.unlink(missing_ok=True)
+    log_act("delete", f"Deleted “{row['title']}”")
+    return {"ok": True, "trash": trash_id}
 
 
 @app.get("/api/tracks/{tid}/lyrics")
@@ -2260,6 +2353,7 @@ def create_folder(req: NameReq):
         cur = con.execute(
             "INSERT INTO playlists(name,url,source,profile_id) VALUES(?,?,?,?)",
             (name, f"folder:{uuid.uuid4().hex}", "folder", profile_id()))
+        log_act("folder", f"Made the folder “{name}”")
         return {"id": cur.lastrowid, "name": name}
 
 
@@ -2270,16 +2364,30 @@ def rename_playlist(pid: int, req: NameReq):
     with db() as con:
         con.execute("UPDATE playlists SET name=? WHERE id=?",
                     (req.name.strip(), pid))
+    log_act("folder", f"Renamed a folder to “{req.name.strip()}”")
     return {"ok": True}
 
 
 @app.delete("/api/playlists/{pid}")
 def delete_playlist(pid: int):
-    """Removes the folder/playlist only; its tracks stay in the library."""
+    """Removes the folder/playlist only; its tracks stay in the library.
+    The folder itself can be put back from the recycle bin."""
     with db() as con:
+        row = con.execute("SELECT * FROM playlists WHERE id=?", (pid,)).fetchone()
+        if not row:
+            raise HTTPException(404)
+        data = {"row": dict(row),
+                "tracks": [[m["track_id"], m["position"]] for m in con.execute(
+                    "SELECT track_id,position FROM playlist_tracks WHERE "
+                    "playlist_id=?", (pid,))]}
+        trash_id = con.execute(
+            "INSERT INTO trash(at,profile_id,kind,name,data) VALUES(?,?,?,?,?)",
+            (time.time(), profile_id(), "folder", row["name"],
+             json.dumps(data))).lastrowid
         con.execute("DELETE FROM playlists WHERE id=?", (pid,))
         con.execute("DELETE FROM playlist_tracks WHERE playlist_id=?", (pid,))
-    return {"ok": True}
+    log_act("delete", f"Deleted the folder “{row['name']}”")
+    return {"ok": True, "trash": trash_id}
 
 
 @app.post("/api/playlists/{pid}/tracks")
@@ -2442,17 +2550,53 @@ def loudness_worker():
 
 # ----------------------------------------------------------------- profiles
 # One library, several people: each profile has its own likes, history,
-# play counts and folders. There is no password per profile.
+# play counts and folders. A profile can have a PIN, and can be a "listen
+# only" profile for children. The first profile is the owner: it can manage
+# the others.
+PIN_RE = re.compile(r"\d{4,8}")
+
+
+def unlocked(pid: int) -> bool:
+    info = _profile_info.get(pid)
+    return bool(info) and (not info["pin"]
+                           or _profile_keys.get(_profile_key.get()) == pid)
+
+
+def manage_check(target: int):
+    """May the profile making this request change profile `target`?"""
+    me = profile_id()
+    if (_profile_info.get(me) or {}).get("kid"):
+        raise HTTPException(403, "A listen-only profile cannot change profiles")
+    if not unlocked(me):
+        raise HTTPException(423, "This profile is locked with a PIN")
+    t = _profile_info.get(target)
+    if not t:
+        raise HTTPException(404, "No such profile")
+    if t["pin"] and me not in (target, 1):
+        raise HTTPException(403, "Only that profile itself or the first "
+                                 "profile can change it")
+
+
+def new_profile_key(pid: int) -> str:
+    key = secrets.token_urlsafe(24)
+    with db() as con:
+        con.execute("INSERT INTO profile_keys VALUES(?,?)", (key, pid))
+    _profile_keys[key] = pid
+    return key
+
+
 @app.get("/api/profiles")
 def profiles():
     with db() as con:
-        rows = [dict(r) for r in con.execute(
-            "SELECT id,name FROM profiles ORDER BY id")]
+        rows = [{"id": r["id"], "name": r["name"], "kid": bool(r["kid"]),
+                 "locked": bool(r["pin"])} for r in con.execute(
+            "SELECT id,name,pin,kid FROM profiles ORDER BY id")]
     return {"current": profile_id(), "profiles": rows}
 
 
 @app.post("/api/profiles")
 def create_profile(req: NameReq):
+    manage_check(profile_id())
     name = req.name.strip()[:30]
     if not name:
         raise HTTPException(400, "Name is required")
@@ -2462,11 +2606,13 @@ def create_profile(req: NameReq):
         pid = con.execute("INSERT INTO profiles(name) VALUES(?)",
                           (name,)).lastrowid
     load_profiles()
+    log_act("profile", f"Added the profile “{name}”")
     return {"id": pid, "name": name}
 
 
 @app.patch("/api/profiles/{pid}")
 def rename_profile(pid: int, req: NameReq):
+    manage_check(pid)
     name = req.name.strip()[:30]
     if not name:
         raise HTTPException(400, "Name is required")
@@ -2481,14 +2627,302 @@ def delete_profile(pid: int):
     themselves stay in the library."""
     if pid == 1:
         raise HTTPException(400, "The first profile cannot be deleted")
+    manage_check(pid)
     with db() as con:
+        name = con.execute("SELECT name FROM profiles WHERE id=?",
+                           (pid,)).fetchone()["name"]
         con.execute("DELETE FROM playlist_tracks WHERE playlist_id IN "
                     "(SELECT id FROM playlists WHERE profile_id=?)", (pid,))
         con.execute("DELETE FROM playlists WHERE profile_id=?", (pid,))
         con.execute("DELETE FROM profile_tracks WHERE profile_id=?", (pid,))
+        con.execute("DELETE FROM profile_keys WHERE profile_id=?", (pid,))
         con.execute("DELETE FROM profiles WHERE id=?", (pid,))
     load_profiles()
+    log_act("profile", f"Deleted the profile “{name}”")
     return {"ok": True}
+
+
+class PinReq(BaseModel):
+    pin: str = ""
+
+
+@app.post("/api/profiles/{pid}/unlock")
+def unlock_profile(pid: int, req: PinReq):
+    info = _profile_info.get(pid)
+    if not info:
+        raise HTTPException(404, "No such profile")
+    if info["pin"] and not check_pw(req.pin, info["pin"]):
+        time.sleep(0.7)  # slows down guessing
+        raise HTTPException(403, "Wrong PIN")
+    return {"key": new_profile_key(pid) if info["pin"] else ""}
+
+
+@app.put("/api/profiles/{pid}/pin")
+def set_profile_pin(pid: int, req: PinReq):
+    """Set a PIN (4 to 8 digits) or, with an empty one, remove it."""
+    manage_check(pid)
+    if req.pin and not PIN_RE.fullmatch(req.pin):
+        raise HTTPException(400, "A PIN is 4 to 8 digits")
+    with db() as con:
+        con.execute("UPDATE profiles SET pin=? WHERE id=?",
+                    (hash_pw(req.pin) if req.pin else None, pid))
+        con.execute("DELETE FROM profile_keys WHERE profile_id=?", (pid,))
+    load_profiles()
+    # whoever set it stays signed in to that profile on this browser
+    return {"key": new_profile_key(pid) if req.pin else ""}
+
+
+class KidReq(BaseModel):
+    kid: bool
+
+
+@app.put("/api/profiles/{pid}/kid")
+def set_profile_kid(pid: int, req: KidReq):
+    if pid == 1:
+        raise HTTPException(400, "The first profile always has full access")
+    manage_check(pid)
+    with db() as con:
+        con.execute("UPDATE profiles SET kid=? WHERE id=?",
+                    (1 if req.kid else 0, pid))
+    load_profiles()
+    return {"ok": True}
+
+
+# ----------------------------------------- activity log and the recycle bin
+# What was added, changed and deleted, and by which profile. Deleted songs
+# and folders wait in the recycle bin for 30 days and can be put back.
+TRASH_DAYS = 30
+
+
+def log_act(action: str, text: str, profile: int | None = None):
+    try:
+        with db() as con:
+            con.execute("INSERT INTO activity(at,profile_id,action,text) "
+                        "VALUES(?,?,?,?)",
+                        (time.time(), profile if profile is not None
+                         else profile_id(), action, text[:300]))
+            con.execute("DELETE FROM activity WHERE id <= "
+                        "(SELECT MAX(id) FROM activity) - 3000")
+    except Exception:
+        pass  # the log must never break the action itself
+
+
+def trash_files(con) -> set:
+    """Names of the files that songs in the recycle bin still need."""
+    names = set()
+    for r in con.execute("SELECT data FROM trash WHERE kind='song'"):
+        row = json.loads(r["data"])["row"]
+        names.update(Path(n).name for n in (row.get("file"),
+                                            row.get("video_file")) if n)
+    return names
+
+
+def drop_song_files(names, con):
+    """Delete files unless a song or the recycle bin still uses them."""
+    held = trash_files(con)
+    for n in {Path(n).name for n in names if n}:
+        used = con.execute("SELECT 1 FROM tracks WHERE file=? OR video_file=?",
+                           (n, n)).fetchone()
+        if not used and n not in held:
+            (MUSIC / n).unlink(missing_ok=True)
+
+
+def purge_trash(ids=None, older_than: float | None = None):
+    with db() as con:
+        if ids is not None:
+            marks = ",".join("?" * len(ids)) or "NULL"
+            items = con.execute(f"SELECT * FROM trash WHERE id IN ({marks})",
+                                list(ids)).fetchall()
+        elif older_than is not None:
+            items = con.execute("SELECT * FROM trash WHERE at<?",
+                                (older_than,)).fetchall()
+        else:
+            items = con.execute("SELECT * FROM trash").fetchall()
+        for it in items:
+            con.execute("DELETE FROM trash WHERE id=?", (it["id"],))
+        for it in items:
+            if it["kind"] == "song":
+                row = json.loads(it["data"])["row"]
+                drop_song_files([row.get("file"), row.get("video_file")], con)
+                (COVERS / f"trash_{it['id']}.jpg").unlink(missing_ok=True)
+    return len(items)
+
+
+@app.get("/api/trash")
+def trash_list():
+    purge_trash(older_than=time.time() - TRASH_DAYS * 86400)
+    out = []
+    with db() as con:
+        for r in con.execute("SELECT * FROM trash ORDER BY at DESC"):
+            data = json.loads(r["data"])
+            row = data["row"]
+            item = {"id": r["id"], "kind": r["kind"], "name": r["name"],
+                    "at": r["at"], "profile_id": r["profile_id"],
+                    "days_left": max(0, TRASH_DAYS - int(
+                        (time.time() - r["at"]) / 86400))}
+            if r["kind"] == "song":
+                item.update(artist=row.get("artist") or "",
+                            video_id=row.get("video_id"),
+                            bytes=file_size(row.get("file"))
+                            + file_size(row.get("video_file")))
+            else:
+                item["count"] = len(data.get("tracks") or [])
+            out.append(item)
+    return out
+
+
+@app.post("/api/trash/{xid}/restore")
+def trash_restore(xid: int):
+    with db() as con:
+        it = con.execute("SELECT * FROM trash WHERE id=?", (xid,)).fetchone()
+        if not it:
+            raise HTTPException(404, "That is no longer in the recycle bin")
+        data = json.loads(it["data"])
+        row = dict(data["row"])
+        if it["kind"] == "song":
+            if con.execute("SELECT 1 FROM tracks WHERE ext_id=?",
+                           (row.get("ext_id"),)).fetchone():
+                raise HTTPException(409, "This song is in the library again "
+                                         "already")
+            if con.execute("SELECT 1 FROM tracks WHERE id=?",
+                           (row["id"],)).fetchone():
+                row.pop("id")  # its old number was given to a newer song
+            cols = {r["name"] for r in con.execute("PRAGMA table_info(tracks)")}
+            keys = [k for k in row if k in cols]
+            cur = con.execute(
+                f"INSERT INTO tracks({','.join(keys)}) VALUES("
+                f"{','.join('?' * len(keys))})", [row[k] for k in keys])
+            tid = row.get("id") or cur.lastrowid
+            for pid, pos in data.get("folders") or []:
+                if con.execute("SELECT 1 FROM playlists WHERE id=?",
+                               (pid,)).fetchone():
+                    con.execute("INSERT OR IGNORE INTO playlist_tracks "
+                                "VALUES(?,?,?)", (pid, tid, pos))
+            for p in data.get("profiles") or []:
+                if p[0] in _profile_info:
+                    con.execute("INSERT OR REPLACE INTO profile_tracks "
+                                "VALUES(?,?,?,?,?)", (p[0], tid, *p[1:]))
+            cover = COVERS / f"trash_{xid}.jpg"
+            if cover.exists():
+                cover.replace(COVERS / f"{tid}.jpg")
+            new_id = tid
+        else:
+            if con.execute("SELECT 1 FROM playlists WHERE url=?",
+                           (row.get("url"),)).fetchone():
+                row["url"] = f"folder:{uuid.uuid4().hex}"
+            if con.execute("SELECT 1 FROM playlists WHERE id=?",
+                           (row["id"],)).fetchone():
+                row.pop("id")
+            cols = {r["name"] for r in
+                    con.execute("PRAGMA table_info(playlists)")}
+            keys = [k for k in row if k in cols]
+            cur = con.execute(
+                f"INSERT INTO playlists({','.join(keys)}) VALUES("
+                f"{','.join('?' * len(keys))})", [row[k] for k in keys])
+            new_id = row.get("id") or cur.lastrowid
+            for tid, pos in data.get("tracks") or []:
+                if con.execute("SELECT 1 FROM tracks WHERE id=?",
+                               (tid,)).fetchone():
+                    con.execute("INSERT OR IGNORE INTO playlist_tracks "
+                                "VALUES(?,?,?)", (new_id, tid, pos))
+        con.execute("DELETE FROM trash WHERE id=?", (xid,))
+    log_act("restore", f"Put back “{it['name']}”")
+    return {"ok": True, "kind": it["kind"], "id": new_id}
+
+
+@app.delete("/api/trash/{xid}")
+def trash_delete(xid: int):
+    return {"deleted": purge_trash(ids=[xid])}
+
+
+@app.delete("/api/trash")
+def trash_empty():
+    n = purge_trash()
+    if n:
+        log_act("delete", f"Emptied the recycle bin ({n} item(s))")
+    return {"deleted": n}
+
+
+@app.get("/api/activity")
+def activity():
+    with db() as con:
+        return [dict(r) for r in con.execute(
+            "SELECT a.id,a.at,a.action,a.text,a.profile_id,p.name AS profile "
+            "FROM activity a LEFT JOIN profiles p ON p.id=a.profile_id "
+            "ORDER BY a.id DESC LIMIT 300")]
+
+
+# -------------------------------------------------- lyrics from the sound (AI)
+class TranscribeReq(BaseModel):
+    language: str = ""   # "" = let the AI detect it
+
+
+@app.post("/api/tracks/{tid}/lyrics/transcribe")
+def lyrics_transcribe(tid: int, req: TranscribeReq):
+    """Listen to the singing and write synced lyrics (AI add-on)."""
+    with db() as con:
+        row = con.execute("SELECT title FROM tracks WHERE id=? AND "
+                          "status='ready'", (tid,)).fetchone()
+    if not row:
+        raise HTTPException(404, "That song is not in the library")
+    return ai_queue({"kind": "lyrics", "track_id": tid, "label": row["title"],
+                     "language": req.language.strip()[:12]})
+
+
+def lrc_from_lines(lines: list) -> str:
+    out = []
+    for ln in lines:
+        t = max(0.0, float(ln["start"] or 0))
+        out.append(f"[{int(t // 60):02d}:{t % 60:05.2f}] {ln['text']}")
+    return "\n".join(out)
+
+
+def run_lyrics(job: dict):
+    with db() as con:
+        row = con.execute("SELECT * FROM tracks WHERE id=?",
+                          (job["track_id"],)).fetchone()
+    if not row or not row["file"]:
+        raise RuntimeError("That song is no longer in the library")
+    res = ai_call("/transcribe", {"src": str(MUSIC / Path(row["file"]).name),
+                                  "language": job.get("language") or ""}, 3600)
+    lines = res.get("lines") or []
+    if not lines:
+        raise RuntimeError(f"No singing was found in “{row['title']}”")
+    with db() as con:
+        con.execute("UPDATE tracks SET lyrics=?,lyrics_state='synced',"
+                    "lyrics_offset=0 WHERE id=?",
+                    (lrc_from_lines(lines), row["id"]))
+    notify(f"Lyrics for “{row['title']}” are written ({len(lines)} lines)")
+
+
+# ------------------------------------------------------------ extend a song
+class ExtendReq(BaseModel):
+    track_id: int
+    where: str = "end"      # "end" = longer ending, "start" = new intro
+    seconds: int = 30
+    style: str = ""
+    lyrics: str = ""
+    title: str = ""
+
+
+@app.post("/api/studio/extend")
+def studio_extend(req: ExtendReq):
+    """Make a song longer: new music is written after its end or before its
+    start, in the song's own sound."""
+    row = _studio_source(req.track_id)
+    where = "start" if req.where == "start" else "end"
+    fields = _song_fields(req)
+    if not fields["style"]:
+        fields["style"] = ("an intro that leads into the song, same style and "
+                           "instruments" if where == "start" else
+                           "the song continues in the same style and "
+                           "instruments, then comes to a natural ending")
+    return ai_queue({"kind": "extend", "track_id": req.track_id,
+                     "label": (req.title.strip()
+                               or f"{row['title']} (Extended)")[:120],
+                     "artist": row["artist"], "where": where,
+                     "seconds": max(10, min(60, req.seconds)), **fields},
+                    songs=True)
 
 
 # ----------------------------------------------------------------- clean-up
@@ -2519,6 +2953,7 @@ def unused_files() -> list[Path]:
     with db() as con:
         used = {Path(n).name for r in con.execute(
             "SELECT file,video_file FROM tracks") for n in r if n}
+        used |= trash_files(con)
     now = time.time()
     return [f for f in MUSIC.iterdir() if f.is_file() and f.name not in used
             and now - f.stat().st_mtime > 3600]

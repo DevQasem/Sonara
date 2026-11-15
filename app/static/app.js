@@ -9,6 +9,7 @@ document.querySelector('.app').append($('np'));
 
 // ---------------------------------------------------------------- icons
 const ICONS = {
+  lock: 'M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z',
   devices: 'M4 6h18V4H4c-1.1 0-2 .9-2 2v11H0v3h14v-3H4V6zm19 2h-6c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h6c.55 0 1-.45 1-1V9c0-.55-.45-1-1-1zm-1 9h-4v-7h4v7z',
   person: 'M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z',
   check: 'M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z',
@@ -84,6 +85,7 @@ function applyPrefs() {
   applyEq();
   save('prefs', prefs);
   themeFromCover(current() || null);
+  applyWall();
 }
 
 // The whole app takes its colours from the cover of the song that is playing.
@@ -239,10 +241,11 @@ function fill(r) { const max = +r.max || 1, min = +r.min || 0; r.style.setProper
 // The profile in use on this browser; sent with every request.
 const profile = { id: load('profile', 1), list: [] };
 async function api(path, opts = {}) {
-  opts.headers = { ...(opts.headers || {}), 'X-Profile': profile.id };
+  opts.headers = { ...(opts.headers || {}), 'X-Profile': profile.id, 'X-Profile-Key': load('profileKeys', {})[profile.id] || '' };
   if (opts.body && !(opts.body instanceof Blob)) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(opts.body); }
   const r = await fetch(path, opts);
   if (r.status === 401 && path !== '/api/login') { showLogin(); throw new Error('Login required'); }
+  if (r.status === 423 && !path.startsWith('/api/profiles')) { profileLocked(); throw new Error('This profile is locked with a PIN'); }
   if (!r.ok) { let m = r.statusText; try { m = (await r.json()).detail || m; } catch {} throw new Error(m); }
   return r.json();
 }
@@ -264,7 +267,7 @@ function dialog({ title, text, fields = [], ok = 'Save', danger = false }) {
     if (text) form.append(el('p', null, text));
     const inputs = fields.map(f => {
       const lab = el('label', null, f.label), inp = el('input');
-      inp.type = 'text'; inp.value = f.value || ''; inp.placeholder = f.placeholder || ''; inp.autocomplete = 'off';
+      inp.type = f.type || 'text'; if (f.mode) inp.inputMode = f.mode; inp.value = f.value || ''; inp.placeholder = f.placeholder || ''; inp.autocomplete = 'off';
       lab.append(inp); form.append(lab);
       return inp;
     });
@@ -387,6 +390,7 @@ function trackMenu(t, anchor) {
     items.push(...deviceItems(t));
     items.push({ icon: t.liked ? 'heart' : 'heartLine', label: t.liked ? 'Remove from Liked' : 'Like', fn: () => toggleLike(t) });
     items.push({ icon: 'lyrics', label: 'Show lyrics', fn: () => { if (!current() || current().id !== t.id) playFrom(t.id); openNp(); } });
+    items.push({ icon: 'lyrics', label: 'Write lyrics from the sound (AI)', fn: a => aiLyrics(t, a) });
   }
   items.push({ icon: 'folder', label: 'Add to folder…', fn: a => folderPicker([t], a) });
   if (state.view.type === 'playlist') items.push({ icon: 'minus', label: 'Remove from this folder', fn: async () => {
@@ -444,13 +448,13 @@ function stopPlayer() {
   markCurrent();
 }
 async function deleteTrack(t) {
-  if (!await confirmBox('Delete from library?', `“${t.title}” and its files are removed.`, 'Delete')) return;
+  if (!await confirmBox('Delete from library?', `“${t.title}” goes to the recycle bin and can be put back for 30 days.`, 'Delete')) return;
   gone.add(t.id);
   dropFromList(t.id);
   dropFromPlayer(t.id);
   lyricsCache.delete(t.id);
   if (load('last', {})?.id === t.id) save('last', null);
-  try { await api(`/api/tracks/${t.id}`, { method: 'DELETE' }); toast(`Deleted “${t.title}”`); }
+  try { const r = await api(`/api/tracks/${t.id}`, { method: 'DELETE' }); undoToast(`Deleted “${t.title}”`, r.trash); }
   catch (e) { gone.delete(t.id); toast('Delete failed: ' + e.message, 'error'); }
   await reload(true).catch(() => {});
   gone.delete(t.id);
@@ -496,7 +500,7 @@ async function addToFolder(p, list) {
   if (state.view.type === 'playlist' && state.view.id === p.id) reload(true);
 }
 async function deleteTracks(list) {
-  if (!await confirmBox(`Delete ${list.length} tracks?`, 'They are removed from the library along with their files.', 'Delete')) return;
+  if (!await confirmBox(`Delete ${list.length} tracks?`, 'They go to the recycle bin and can be put back for 30 days.', 'Delete')) return;
   for (const t of list) { gone.add(t.id); dropFromPlayer(t.id); lyricsCache.delete(t.id); }
   reloadSeq++;
   state.tracks = state.tracks.filter(x => !gone.has(x.id)); state.tracksKey = '';
@@ -886,6 +890,7 @@ async function go(view, hist) {
   else if (view.type === 'remix') await renderRemix();
   else if (view.type === 'spotify') renderSpotify();
   else if (view.type === 'cleanup') await renderCleanup();
+  else if (view.type === 'activity') await renderActivity();
   if (hist?.y && state.view === view) $('main').scrollTop = hist.y;
 }
 
@@ -1067,8 +1072,9 @@ function folderMenu(p, anchor, mark) {
     } },
     { icon: 'trash', label: 'Delete folder (keeps songs)', danger: true, fn: async () => {
       if (!await confirmBox('Delete folder?', `“${p.name}” is removed. Its songs stay in the library.`, 'Delete')) return;
-      try { await api(`/api/playlists/${p.id}`, { method: 'DELETE' }); } catch (e) { return toast(e.message, 'error'); }
-      toast(`Deleted the folder “${p.name}”`);
+      let r;
+      try { r = await api(`/api/playlists/${p.id}`, { method: 'DELETE' }); } catch (e) { return toast(e.message, 'error'); }
+      undoToast(`Deleted the folder “${p.name}”`, r.trash);
       if (here()) go({ type: 'folders' }); else redraw();
     } },
   ], p.name);
@@ -1110,7 +1116,7 @@ function renderFolders() {
 }
 // Drag a folder card on the Folders page to put the folders in any order
 // (press and hold it first on a touch screen). The other cards slide aside.
-function cardDrag(e, c, grid, sel = ".card[data-id]", col = false) {
+function cardDrag(e, c, grid, sel = ".card[data-id]", col = false, done = null) {
   const touch = e.pointerType !== 'mouse';
   if (!touch && e.button !== 0) return;
   e.stopPropagation();
@@ -1175,6 +1181,7 @@ function cardDrag(e, c, grid, sel = ".card[data-id]", col = false) {
     const from = c.style.transform;
     c.classList.remove('lifting'); c.style.transform = '';
     const drop = c.animate([{ transform: from }, { transform: 'none' }], { duration: 200, easing: 'cubic-bezier(.2,.8,.2,1)' });  // settle into the gap
+    if (done) { plDrag = false; return done(); }  // a list that is not the folders
     const ids = [...grid.querySelectorAll(sel)].map(x => +x.dataset.id);
     state.playlists.sort((x, y) => ids.indexOf(x.id) - ids.indexOf(y.id));
     try { await api('/api/playlists/order', { method: 'PUT', body: { ids } }); }
@@ -1273,24 +1280,25 @@ async function renderHome() {
   const body = el('div');
   const draw = () => {
     body.replaceChildren();
+    const parts = {};
     const pick = l => l.filter(t => t.status === 'ready' && srcMatch(t, prefs.src));
-    const shelf = (title, cards, more) => {
+    const shelf = (id, title, cards, more) => {
       if (!cards.length) return;
       const row = el('div', 'shelf'); row.append(...cards);
-      body.append(sectionHead(title, more), row);
+      parts[id] = [sectionHead(title, more), row];
     };
     const tiles = l => l.map(t => trackTile(t, l));
-    shelf('Jump back in', tiles(pick(recent).slice(0, 12)), { type: 'recent' });
+    shelf('recent', 'Jump back in', tiles(pick(recent).slice(0, 12)), { type: 'recent' });
     const vids = pick(all).filter(t => t.kind === 'video').slice(0, 12);
-    shelf('Videos', vids.map(t => videoTile(t, vids)));
-    shelf('Recently added', tiles(pick(all).slice(0, 16)), { type: 'library' });
-    shelf('Most played', tiles(pick(top).slice(0, 12)), { type: 'top' });
+    shelf('videos', 'Videos', vids.map(t => videoTile(t, vids)));
+    shelf('added', 'Recently added', tiles(pick(all).slice(0, 16)), { type: 'library' });
+    shelf('top', 'Most played', tiles(pick(top).slice(0, 12)), { type: 'top' });
     const byArtist = new Map();
     for (const t of pick(all)) for (const a of artistsOf(t)) {
       const k = a.toLowerCase(), c = byArtist.get(k) || { name: a, n: 0, t };
       c.n++; byArtist.set(k, c);
     }
-    shelf('Your artists', [...byArtist.values()].sort((a, b) => b.n - a.n).slice(0, 14).map(a => {
+    shelf('artists', 'Your artists', [...byArtist.values()].sort((a, b) => b.n - a.n).slice(0, 14).map(a => {
       const c = el('button', 'card artist'), img = el('img', 'tile');
       img.loading = 'lazy'; img.alt = '';
       img.onerror = () => setImg(img, a.t);  // no artist photo found: use a cover of theirs
@@ -1299,21 +1307,26 @@ async function renderHome() {
       c.onclick = () => go({ type: 'artist', name: a.name });
       return c;
     }));
-    if (prefs.src === 'all') shelf('Folders', state.playlists.map(p => {
+    if (prefs.src === 'all') shelf('folders', 'Folders', state.playlists.map(p => {
       const c = el('button', 'card'), t = el('div', 'tile');
       t.style.background = grad(p.name); t.innerHTML = svg(p.source === 'folder' ? 'folder' : 'music');
       c.append(t, el('b', null, p.name), el('small', null, `${p.count} track${p.count === 1 ? '' : 's'}`));
       c.onclick = () => go({ type: 'playlist', id: p.id, name: p.name, source: p.source });
       return c;
     }), { type: 'folders' });
-    if (!body.children.length) body.append(el('div', 'empty', 'Nothing from this source yet.'));
+    for (const h of homeOrder()) if (h.on && parts[h.id]) body.append(...parts[h.id]);  // the rows and order chosen under Customize
+    if (!body.children.length) body.append(el('div', 'empty', 'Nothing to show here. Choose rows under Customize, or another source.'));
   };
-  main.append(srcChips(draw), body);
+  const chips = srcChips(draw), edit = el('button', 'chip home-edit', 'Customize');
+  edit.title = 'Choose the rows of this page and their order';
+  edit.onclick = () => homeDialog(draw);
+  chips.append(edit);
+  main.append(chips, body);
   draw();
 }
 
 // The AI jobs that are waiting or running, shown at the top of the studio.
-const JOB_WORD = { song: 'Creating', cover: 'Covering', repaint: 'Re-making part of', split: 'Splitting', mashup: 'Mixing', generate: 'Creating' };
+const JOB_WORD = { lyrics: 'Writing the lyrics of', extend: 'Extending', song: 'Creating', cover: 'Covering', repaint: 'Re-making part of', split: 'Splitting', mashup: 'Mixing', generate: 'Creating' };
 function paintAi() {
   const box = $('stJobs');
   if (!box) return;
@@ -1526,6 +1539,13 @@ async function renderRemix() {
     <div class="field col"><label for="rpLyrics">Words for that part (optional)</label><textarea id="rpLyrics" rows="3"></textarea></div>
     <div class="st-go"><small class="st-state" data-need="songs"></small><button class="btn ghost" id="rpGo" data-need="songs" disabled>Re-make it</button></div>
   </div>
+  <div class="box"><h3>Make a song longer</h3>
+    <div class="field"><div><b>Extend a song</b><small>New music is written onto the end, or as an intro before the start, in the song's own sound</small></div><span id="exSongAt"></span></div>
+    <div class="field"><div><label for="exWhere">Where</label></div><select id="exWhere"><option value="end">A longer ending</option><option value="start">A new intro</option></select></div>
+    <div class="field"><div><b>How much</b><small id="exLenL"></small></div><input type="range" id="exLen" min="10" max="60" step="5" value="30"></div>
+    <div class="field col"><label for="exStyle">What it should sound like (optional)</label><textarea id="exStyle" rows="2" placeholder="Leave empty to continue in the same style"></textarea></div>
+    <div class="st-go"><small class="st-state" data-need="songs"></small><button class="btn ghost" id="exGo" data-need="songs" disabled>Extend it</button></div>
+  </div>
   <div class="box"><h3>Split vocals and music</h3>
     <div class="field"><div><b>Instrumental and vocals-only</b><small>Makes two new songs from the one you pick</small></div><span id="spSongAt"></span></div>
     <div class="st-go"><small class="st-state" data-need="available"></small><button class="btn ghost" id="aiSplit" data-need="available" disabled>Split</button></div>
@@ -1559,6 +1579,16 @@ async function renderRemix() {
     if (isNaN(from) || isNaN(to) || to <= from) return toast('Give the part as times, for example from 0:45 to 1:10');
     if (!style) return toast('Describe the style of that part');
     try { await post('/api/studio/repaint', { track_id: id, start: from, end: to, style, lyrics: $('rpLyrics').value.trim() }); sent('Re-making that part'); }
+    catch (e) { toast(e.message, 'error', 9000); }
+  };
+  const exSong = songSelect('Choose a song…');
+  $('exSongAt').replaceWith(exSong);
+  const exLabel = () => { $('exLenL').textContent = $('exLen').value + ' seconds more'; fill($('exLen')); };
+  $('exLen').oninput = exLabel; exLabel();
+  $('exGo').onclick = async () => {
+    const id = +exSong.value;
+    if (!id) return toast('Choose a song first');
+    try { await post('/api/studio/extend', { track_id: id, where: $('exWhere').value, seconds: +$('exLen').value, style: $('exStyle').value.trim() }); sent('Extending the song'); }
     catch (e) { toast(e.message, 'error', 9000); }
   };
   $('aiSplit').onclick = async () => {
@@ -1970,9 +2000,9 @@ addEventListener('keydown', e => {
 // only once the EQ or the visualizer is actually needed.
 let actx, eqNodes, analyser;
 const npOpen = () => $('np').classList.contains('open');
-function ensureEq() {
+function ensureEq(force) {
   const wantEq = prefs.eqOn && prefs.eq.some(g => g), wantViz = prefs.viz !== 'off' && npOpen() && !!current();
-  if (actx || !(wantEq || wantViz || remixOn() || prefs.volume > 1 || normGain() !== 1)) return;
+  if (actx || !(force || wantEq || wantViz || remixOn() || prefs.volume > 1 || normGain() !== 1)) return;
   try {
     actx = new (window.AudioContext || window.webkitAudioContext)();
     let node = actx.createMediaElementSource(audio);
@@ -2233,6 +2263,7 @@ async function showLyrics(refresh = false) {
   box.replaceChildren(); box.scrollTop = 0;
   if (!d.lyrics) {
     box.append(el('p', 'msg', 'No lyrics found for this track. If the title or artist looks wrong, fix it with ⋯ → Edit title / artist, then Re-fetch.'));
+    if (t.id) { const b = el('button', 'btn ghost', 'Write them from the sound (AI)'), w = el('p', 'msg'); b.onclick = e => aiLyrics(t, e.currentTarget); w.append(b); box.append(w); }
     return;
   }
   if (d.state === 'synced') {
@@ -2354,7 +2385,9 @@ async function renderSettings() {
   wrap.innerHTML = `
   <div><h2 class="cat-title" id="catTitle"></h2><p class="cat-sub" id="catSub"></p></div>
   <div class="box" data-cat="appearance"><h3>Theme</h3>
-    <div class="field"><div><b>Mode</b></div><div class="seg" id="setTheme"><button data-v="dark">Dark</button><button data-v="light">Light</button><button data-v="amoled">Black</button></div></div>
+    <div class="field"><div><b>Mode</b></div><div class="seg" id="setTheme"><button data-v="dark">Dark</button><button data-v="light">Light</button><button data-v="amoled">Black</button><button data-v="retro">Retro</button><button data-v="neon">Neon</button><button data-v="ocean">Ocean</button></div></div>
+    <div class="field"><div><b>Background picture</b><small>Your own picture behind the player, kept in this browser</small></div><button class="btn ghost" id="wallPick">Choose…</button><button class="btn ghost" id="wallClear">Remove</button></div>
+    <div class="field"><div><b>Picture brightness</b><small>How strongly the picture shows through</small></div><input type="range" id="wallDim" min="0.15" max="0.85" step="0.05"></div>
     <div class="field"><div><b>Accent colour</b></div><div class="swatches" id="setAccent"></div></div>
   </div>
   <div class="box" data-cat="appearance"><h3>Layout &amp; effects</h3>
@@ -2390,6 +2423,7 @@ async function renderSettings() {
     <div class="field"><div><b>Tidy names of new downloads</b><small>Drops clutter such as “(Official Video)”, “| lyrics” and #tags from YouTube titles, and reads “Artist - Title”. Version notes like (Remix) or (Slowed) stay.</small></div>${sw('setClean')}</div>
     <div class="field"><div><b>Songs already in the library</b><small>Tidy them the same way, or put back the names they were downloaded with</small></div><button class="btn ghost" id="restoreNames">Restore originals</button><button class="btn ghost" id="cleanAll">Tidy now</button></div>
     <div class="field"><div><b>Clean up</b><small>Find duplicates, failed downloads and what uses the disk</small></div><button class="btn ghost" id="openCleanup">Open</button></div>
+    <div class="field"><div><b>Activity and recycle bin</b><small>What was added and deleted, and deleted songs to put back (kept 30 days)</small></div><button class="btn ghost" id="openActivity">Open</button></div>
   </div>
   <div class="box" data-cat="lyrics"><h3>Automatic lyrics</h3>
     <div class="field"><div><b>Download lyrics automatically</b><small>Looks up each new track on LRCLIB</small></div>${sw('setAutoLy')}</div>
@@ -2421,6 +2455,10 @@ async function renderSettings() {
   const paintSeg = () => seg.querySelectorAll('button').forEach(b => b.classList.toggle('sel', b.dataset.v === prefs.theme));
   seg.onclick = e => { const v = e.target.dataset.v; if (!v) return; prefs.theme = v; applyPrefs(); paintSeg(); };
   paintSeg();
+  $('wallPick').onclick = pickWall;
+  $('wallClear').onclick = () => { try { localStorage.removeItem('wall'); } catch {} applyWall(); };
+  const wd = $('wallDim'); wd.value = 1 - (prefs.wallDim ?? 0.55); fill(wd);
+  wd.oninput = () => { prefs.wallDim = Math.round((1 - wd.value) * 100) / 100; save('prefs', prefs); applyWall(); fill(wd); };
   const sws = $('setAccent');
   const paintSw = () => sws.querySelectorAll('button').forEach(b => b.classList.toggle('sel', b.dataset.c === prefs.accent));
   for (const [c, c2] of ACCENTS) { const b = el('button'); b.dataset.c = c; b.style.background = `linear-gradient(135deg,${c},${c2})`; b.title = c; b.onclick = () => { prefs.accent = c; applyPrefs(); paintSw(); }; sws.append(b); }
@@ -2484,6 +2522,7 @@ async function renderSettings() {
   $('upAll').onclick = async () => { try { await post('/api/upgrade'); state.wasPending = true; toast('Checking which songs can be upgraded…'); } catch (e) { toast(e.message, 'error'); } };
   $('cleanAll').onclick = async () => { try { const r = await post('/api/clean-names'); toast(r.count ? `Tidied ${r.count} name(s)` : 'Every name is already tidy'); after(); } catch (e) { toast(e.message, 'error'); } };
   $('openCleanup').onclick = () => { closeSettings(); go({ type: 'cleanup' }); };
+  $('openActivity').onclick = () => { closeSettings(); go({ type: 'activity' }); };
   $('restoreNames').onclick = async () => { try { const r = await post('/api/restore-names'); toast(r.count ? `Restored ${r.count} name(s)` : 'Nothing to restore'); after(); } catch (e) { toast(e.message, 'error'); } };
   $('retryAll').onclick = async () => { const r = await post('/api/retry-failed'); state.wasPending = true; toast(`Retrying ${r.count} track(s)`); };
   $('lyAll').onclick = async () => { const r = await post('/api/lyrics/all'); toast(r.count ? `Looking up lyrics for ${r.count} track(s) in the background` : 'Every track has already been checked'); };
@@ -2524,7 +2563,7 @@ async function poll() {
     paintDownloads();
     const before = (state.ai || []).length;
     state.ai = s.ai || []; paintAi();
-    if (state.ai.length < before && state.studioRefresh) state.studioRefresh();  // a studio job finished
+    if (state.ai.length < before) { lyricsCache.clear(); state.lyricsFor = null; if (npOpen()) showLyrics(); if (state.studioRefresh) state.studioRefresh(); }  // a studio job finished
     if (s.pending || state.wasPending) await reload();
     state.wasPending = s.pending > 0;
   } catch {}
@@ -2718,7 +2757,7 @@ async function renderCleanup() {
     for (const t of d.big) {
       const del = el('button', 'icon-btn'); del.innerHTML = svg('trash'); del.title = 'Delete from library';
       del.onclick = async () => {
-        if (!await confirmBox('Delete from library?', `“${t.title}” and its files are removed.`, 'Delete')) return;
+        if (!await confirmBox('Delete from library?', `“${t.title}” goes to the recycle bin and can be put back for 30 days.`, 'Delete')) return;
         try { await api(`/api/tracks/${t.id}`, { method: 'DELETE' }); dropFromPlayer(t.id); state.tracksKey = ''; again(); } catch (e) { toast(e.message, 'error'); }
       };
       b.append(line(t, about(t), del));
@@ -2869,8 +2908,11 @@ function paintProfile() {
   $('profAv').textContent = (n.trim()[0] || '?').toUpperCase();
   $('profAv').style.background = grad(n);
   $('profName').textContent = n;
+  document.body.classList.toggle('kid', !!(profile.list.find(p => p.id === profile.id) || {}).kid);
 }
 async function useProfile(id, quiet) {
+  const target = profile.list.find(x => x.id === id);
+  if (target && target.locked && !profileKeys[id] && !await askPin(target)) return;
   profile.id = id; save('profile', id); paintProfile();
   state.tracksKey = ''; state.search = null;
   await loadPlaylists();
@@ -2878,23 +2920,381 @@ async function useProfile(id, quiet) {
   if (!quiet) toast(`Now listening as ${profileName()}`);
 }
 $('profBtn').onclick = e => {
-  const items = profile.list.map(p => ({ icon: p.id === profile.id ? 'check' : 'person', label: p.name, fn: () => { if (p.id !== profile.id) useProfile(p.id); } }));
+  const items = profile.list.map(p => ({ icon: p.id === profile.id ? 'check' : p.locked ? 'lock' : 'person', label: p.name + (p.kid ? ' (listen-only)' : ''), fn: () => { if (p.id !== profile.id) useProfile(p.id); } }));
   items.push({ icon: 'plus', label: 'Add a profile…', fn: async () => {
     const r = await dialog({ title: 'New profile', text: 'A profile has its own likes, history and folders. Everyone shares the same songs.', fields: [{ label: 'Name', placeholder: 'For example: Sara' }], ok: 'Create' });
     if (!r || !r[0]) return;
     try { const p = await post('/api/profiles', { name: r[0] }); await loadProfiles(); useProfile(p.id); } catch (err) { toast(err.message, 'error'); }
   } });
-  items.push({ icon: 'edit', label: `Rename “${profileName()}”`, fn: async () => {
-    const r = await dialog({ title: 'Rename profile', fields: [{ label: 'Name', value: profileName() }] });
-    if (!r || !r[0]) return;
-    try { await api('/api/profiles/' + profile.id, { method: 'PATCH', body: { name: r[0] } }); await loadProfiles(); } catch (err) { toast(err.message, 'error'); }
-  } });
-  if (profile.id !== 1) items.push({ icon: 'trash', label: `Delete “${profileName()}”`, danger: true, fn: async () => {
-    if (!await confirmBox('Delete this profile?', `“${profileName()}” loses its likes, history and folders. The songs stay in the library.`, 'Delete')) return;
-    try { await api('/api/profiles/' + profile.id, { method: 'DELETE' }); profile.id = 1; await loadProfiles(); useProfile(1); } catch (err) { toast(err.message, 'error'); }
-  } });
+  if (!document.body.classList.contains('kid')) items.push({ icon: 'tune', label: 'Manage profiles…', fn: a => openMenu(a, profile.list.map(p => ({ icon: p.locked ? 'lock' : 'person', label: p.name + (p.kid ? ' (listen-only)' : ''), fn: a2 => profileActions(p, a2) })), 'Manage profiles') });
   openMenu(e.currentTarget, items, 'Who is listening?');
 };
+
+// ------------------------------------------- recycle bin and activity log
+const ago = ts => { const s = Date.now() / 1000 - ts; return s < 90 ? 'just now' : s < 3600 ? Math.round(s / 60) + ' min ago' : s < 86400 ? Math.round(s / 3600) + ' h ago' : Math.round(s / 86400) + ' day' + (Math.round(s / 86400) === 1 ? '' : 's') + ' ago'; };
+// A "Deleted …" message with an Undo button (the item waits in the bin).
+function undoToast(msg, trashId) {
+  const t = toast(msg, 'info', 9000);
+  if (!trashId) return t;
+  const b = el('button', 'toast-btn', 'Undo');
+  b.onclick = async () => {
+    t.remove();
+    try { await post(`/api/trash/${trashId}/restore`); toast('Put back'); state.tracksKey = ''; await loadPlaylists(); if (isList(state.view)) reload(true); else if (['folders', 'home', 'activity'].includes(state.view.type)) go(state.view, {}); }
+    catch (e) { toast(e.message, 'error'); }
+  };
+  t.append(b);
+  return t;
+}
+async function renderActivity() {
+  const view = state.view, main = $('main');
+  main.replaceChildren(hero('Library', 'Activity', 'history'));
+  state.shown = [];
+  $('heroSub').textContent = 'What was added, changed and deleted. Deleted songs and folders wait in the recycle bin for 30 days.';
+  let bin, log;
+  try { [bin, log] = await Promise.all([api('/api/trash'), api('/api/activity')]); }
+  catch (e) { if (state.view === view) main.append(el('div', 'empty', e.message)); return; }
+  if (state.view !== view) return;
+  const again = () => { if (state.view === view) renderActivity(); };
+  const box = title => { const b = el('div', 'box cl-box'), h = el('div', 'cl-h'); h.append(el('h3', null, title)); b.append(h); main.append(b); return b; };
+  const who = id => (profile.list.find(p => p.id === id) || { name: 'someone' }).name;
+  const b = box(bin.length ? `Recycle bin — ${bin.length}` : 'Recycle bin');
+  if (!bin.length) b.append(el('p', 'cl-note', 'Empty. Songs and folders you delete come here first, so a mistake can be undone.'));
+  else {
+    const empty = el('button', 'btn', 'Empty the bin');
+    empty.onclick = async () => {
+      if (!await confirmBox('Empty the recycle bin?', `${bin.length} item${bin.length === 1 ? ' is' : 's are'} deleted for good. This cannot be undone.`, 'Delete for good')) return;
+      try { await api('/api/trash', { method: 'DELETE' }); toast('The recycle bin is empty'); again(); } catch (e) { toast(e.message, 'error'); }
+    };
+    b.querySelector('.cl-h').append(empty);
+    for (const x of bin) {
+      const r = el('div', 'cl-row'), m = el('div', 'm');
+      if (x.kind === 'song') { const img = el('img'); img.alt = ''; img.loading = 'lazy'; setImg(img, { title: x.name, id: 'bin' + x.id, video_id: x.video_id }); r.append(img); }
+      else { const ico = el('span', 'cl-ico'); ico.innerHTML = svg('folder'); r.append(ico); }
+      m.append(el('b', null, x.name), el('small', null, [x.kind === 'song' ? x.artist : `folder · ${x.count} song${x.count === 1 ? '' : 's'}`, `deleted ${ago(x.at)} by ${who(x.profile_id)}`, `${x.days_left} day${x.days_left === 1 ? '' : 's'} left`, x.bytes ? bytes(x.bytes) : ''].filter(Boolean).join(' · ')));
+      const back = el('button', 'btn ghost', 'Put back'), del = el('button', 'icon-btn');
+      del.innerHTML = svg('trash'); del.title = 'Delete for good';
+      back.onclick = async () => { try { await post(`/api/trash/${x.id}/restore`); toast(`“${x.name}” is back`); state.tracksKey = ''; loadPlaylists(); again(); } catch (e) { toast(e.message, 'error'); } };
+      del.onclick = async () => {
+        if (!await confirmBox('Delete for good?', `“${x.name}” cannot be brought back after this.`, 'Delete for good')) return;
+        try { await api(`/api/trash/${x.id}`, { method: 'DELETE' }); again(); } catch (e) { toast(e.message, 'error'); }
+      };
+      r.append(m, back, del); b.append(r);
+    }
+  }
+  const a = box('What happened');
+  if (!log.length) a.append(el('p', 'cl-note', 'Nothing yet.'));
+  for (const x of log) {
+    const r = el('div', 'act-row');
+    r.append(el('span', 'act-t', ago(x.at)), el('span', 'act-p', x.profile || 'someone'), el('span', null, x.text));
+    a.append(r);
+  }
+}
+
+// ---------------------------------------------- profile PIN and kids mode
+const profileKeys = load('profileKeys', {});
+async function askPin(p) {
+  for (;;) {
+    const r = await dialog({ title: `PIN for ${p.name}`, text: 'This profile is locked.', fields: [{ label: 'PIN', type: 'password', mode: 'numeric' }], ok: 'Unlock' });
+    if (!r) return false;
+    try {
+      const k = await api(`/api/profiles/${p.id}/unlock`, { method: 'POST', body: { pin: r[0] } });
+      profileKeys[p.id] = k.key; save('profileKeys', profileKeys);
+      return true;
+    } catch (e) { toast(e.message, 'error'); }
+  }
+}
+// The server refused because the profile in use has a PIN this browser has
+// not entered yet: ask for it, or fall back to a profile without one.
+let pinAsking = null;
+function profileLocked() {
+  if (pinAsking) return pinAsking;
+  pinAsking = (async () => {
+    await loadProfiles();
+    const me = profile.list.find(p => p.id === profile.id);
+    if (!(me && await askPin(me))) {
+      const free = profile.list.find(p => !p.locked);
+      if (free) { profile.id = free.id; save('profile', free.id); }
+    }
+    pinAsking = null;
+    paintProfile(); state.tracksKey = '';
+    await loadPlaylists(); go({ type: 'home' }, {});
+  })();
+  return pinAsking;
+}
+// Rename, PIN, kids mode and delete for one profile.
+function profileActions(p, anchor) {
+  const reload2 = async () => { await loadProfiles(); };
+  const fail = e => toast(e.message, 'error');
+  const items = [{ icon: 'edit', label: 'Rename', fn: async () => {
+    const r = await dialog({ title: 'Rename profile', fields: [{ label: 'Name', value: p.name }] });
+    if (r && r[0]) api('/api/profiles/' + p.id, { method: 'PATCH', body: { name: r[0] } }).then(reload2, fail);
+  } }];
+  items.push({ icon: 'lock', label: p.locked ? 'Change the PIN…' : 'Set a PIN…', fn: async () => {
+    const r = await dialog({ title: `PIN for ${p.name}`, text: '4 to 8 digits. It is asked for when someone switches to this profile.', fields: [{ label: 'New PIN', type: 'password', mode: 'numeric' }], ok: 'Set PIN' });
+    if (!r || !r[0]) return;
+    try { const k = await api(`/api/profiles/${p.id}/pin`, { method: 'PUT', body: { pin: r[0] } }); profileKeys[p.id] = k.key; save('profileKeys', profileKeys); toast(`${p.name} now has a PIN`); reload2(); } catch (e) { fail(e); }
+  } });
+  if (p.locked) items.push({ icon: 'close', label: 'Remove the PIN', fn: () => api(`/api/profiles/${p.id}/pin`, { method: 'PUT', body: { pin: '' } }).then(() => { toast('PIN removed'); reload2(); }, fail) });
+  if (p.id !== 1) {
+    items.push({ icon: p.kid ? 'check' : 'heart', label: p.kid ? 'Listen-only: on (turn off)' : 'Make listen-only (for kids)', fn: () => api(`/api/profiles/${p.id}/kid`, { method: 'PUT', body: { kid: !p.kid } }).then(() => { toast(p.kid ? `${p.name} has full access again` : `${p.name} can now only listen: no downloading, deleting or changing`); reload2(); }, fail) });
+    items.push({ icon: 'trash', label: 'Delete this profile', danger: true, fn: async () => {
+      if (!await confirmBox('Delete this profile?', `“${p.name}” loses its likes, history and folders. The songs stay in the library.`, 'Delete')) return;
+      try { await api('/api/profiles/' + p.id, { method: 'DELETE' }); const mine = p.id === profile.id; await loadProfiles(); if (mine) useProfile(1); } catch (e) { fail(e); }
+    } });
+  }
+  openMenu(anchor, items, p.name);
+}
+
+// ------------------------------------------------ lyrics from the sound (AI)
+function aiLyrics(t, anchor) {
+  const go1 = language => post(`/api/tracks/${t.id}/lyrics/transcribe`, { language }).then(
+    () => { state.wasPending = true; toast(`Listening to “${t.title}” and writing its lyrics. This takes a few minutes.`, 'info', 8000); },
+    e => toast(e.message, 'error', 9000));
+  openMenu(anchor, [
+    { icon: 'lyrics', label: 'Detect the language', fn: () => go1('') },
+    { icon: 'lyrics', label: 'Arabic', fn: () => go1('arabic') },
+    { icon: 'lyrics', label: 'Turkish', fn: () => go1('turkish') },
+    { icon: 'lyrics', label: 'English', fn: () => go1('english') },
+  ], 'Write lyrics from the sound');
+}
+
+// ------------------------------------------------------------- lyric cards
+// A picture (or a short video with the music) of one to four lyric lines
+// over the song's cover, to save or share.
+const CARD_SIZES = { Portrait: [1080, 1350], Square: [1080, 1080], Story: [1080, 1920] };
+function loadCardCover(t) {
+  const url = !t.cover && t.video_id ? `/api/thumb/${t.video_id}` : coverUrl(t);
+  return new Promise(res => {
+    const im = new Image();
+    if (/^https?:/.test(url)) im.crossOrigin = 'anonymous';
+    im.onload = () => res(im); im.onerror = () => res(null);
+    im.src = url;
+  });
+}
+function wrapText(g, text, maxW) {
+  const out = []; let line = '';
+  for (const w of String(text).split(/\s+/)) {
+    const tryLine = line ? line + ' ' + w : w;
+    if (line && g.measureText(tryLine).width > maxW) { out.push(line); line = w; } else line = tryLine;
+  }
+  if (line) out.push(line);
+  return out;
+}
+const rtlText = s => /[֐-ࣿ]/.test(s);
+function drawCard(cv, o) {
+  const g = cv.getContext('2d'), W = cv.width, H = cv.height, font = 'system-ui, "Segoe UI", Tahoma, sans-serif';
+  g.globalAlpha = 1; g.shadowBlur = 0; g.filter = 'none';
+  const bgc = g.createLinearGradient(0, 0, W, H);
+  const cs0 = getComputedStyle(root);
+  bgc.addColorStop(0, cs0.getPropertyValue('--accent').trim() || '#8b5cf6'); bgc.addColorStop(1, cs0.getPropertyValue('--accent2').trim() || '#ec4899');
+  g.fillStyle = bgc; g.fillRect(0, 0, W, H);
+  if (o.img) {
+    const s = Math.max(W / o.img.width, H / o.img.height) * 1.2 * (o.zoom || 1);
+    g.save(); g.filter = 'blur(34px) saturate(1.5)';
+    g.drawImage(o.img, (W - o.img.width * s) / 2, (H - o.img.height * s) / 2, o.img.width * s, o.img.height * s);
+    g.restore();
+  }
+  const dim = g.createLinearGradient(0, 0, 0, H);
+  dim.addColorStop(0, 'rgba(0,0,0,.38)'); dim.addColorStop(1, 'rgba(0,0,0,.74)');
+  g.fillStyle = dim; g.fillRect(0, 0, W, H);
+  // the lyric lines
+  const size = Math.round(W * (o.lines.length > 2 ? 0.056 : 0.068));
+  g.font = `800 ${size}px ${font}`; g.textAlign = 'center'; g.textBaseline = 'middle';
+  const rows = [];
+  o.lines.forEach((text, i) => { g.direction = rtlText(text) ? 'rtl' : 'ltr'; for (const w of wrapText(g, text, W * 0.84)) rows.push({ w, i, dir: g.direction }); });
+  const lh = size * 1.34, top = H * 0.43 - rows.length * lh / 2;
+  g.fillStyle = '#fff'; g.shadowColor = 'rgba(0,0,0,.55)'; g.shadowBlur = 22;
+  rows.forEach((r, k) => {
+    const a = o.alpha ? o.alpha[r.i] : 1;
+    g.globalAlpha = a * (o.active == null || o.active === r.i ? 1 : 0.45);
+    g.direction = r.dir;
+    g.fillText(r.w, W / 2, top + k * lh + lh / 2 + (1 - a) * size * 0.4);
+  });
+  g.globalAlpha = 1; g.shadowBlur = 0;
+  // the song: small cover, title and artist
+  const c = W * 0.13, x = W * 0.08, y = H - c - W * 0.08;
+  if (o.img) {
+    const m = Math.min(o.img.width, o.img.height);
+    g.save(); g.beginPath(); g.roundRect ? g.roundRect(x, y, c, c, c * 0.18) : g.rect(x, y, c, c); g.clip();
+    g.drawImage(o.img, (o.img.width - m) / 2, (o.img.height - m) / 2, m, m, x, y, c, c);
+    g.restore();
+  }
+  const tx = o.img ? x + c + W * 0.03 : x, fit = (s, f) => { g.font = f; let v = s; while (v.length > 4 && g.measureText(v).width > W - tx - x) v = v.slice(0, -2); return v === s ? s : v.trimEnd() + '…'; };
+  g.textAlign = 'left'; g.direction = 'ltr'; g.fillStyle = '#fff';
+  const f1 = `700 ${Math.round(W * 0.036)}px ${font}`, f2 = `500 ${Math.round(W * 0.029)}px ${font}`;
+  g.fillText(fit(o.title, f1), tx, y + c * 0.34);
+  g.fillStyle = 'rgba(255,255,255,.75)';
+  g.fillText(fit(o.artist || '', f2), tx, y + c * 0.7);
+}
+// Which video format this browser can really record (some say they can make
+// MP4 and then fail), found once by recording for half a second.
+let recType;
+async function pickRecType(stream) {
+  if (recType !== undefined) return recType;
+  for (const type of ['video/mp4;codecs=avc1,mp4a.40.2', 'video/webm;codecs=vp9,opus', 'video/webm']) {
+    if (!MediaRecorder.isTypeSupported(type)) continue;
+    try {
+      const rec = new MediaRecorder(stream, { mimeType: type });
+      let size = 0, bad = false;
+      rec.ondataavailable = e => { size += e.data.size; };
+      rec.onerror = () => { bad = true; };
+      const end = new Promise(res => { rec.onstop = res; });
+      rec.start();
+      await new Promise(res => setTimeout(res, 500));
+      if (rec.state !== 'inactive') rec.stop();
+      await Promise.race([end, new Promise(res => setTimeout(res, 1500))]);
+      if (size && !bad) return (recType = type);
+    } catch {}
+  }
+  return (recType = null);
+}
+async function lyricCard(index) {
+  const t = current();
+  const ps = [...$('lyrics').children].filter(p => !p.classList.contains('msg'));
+  if (!t || !ps.length) return toast('Play a song with lyrics first');
+  const synced = lyLines.length === ps.length;
+  const all = ps.map((p, i) => ({ text: p.textContent.trim(), time: synced ? lyLines[i].time : null }));
+  let start = Math.max(0, Math.min(index, all.length - 1)), count = 2, shape = 'Portrait';
+  while (start < all.length - 1 && (!all[start].text || all[start].text === '♪')) start++;
+  const img = await loadCardCover(t);
+  const wrap = el('div', 'modal dlg-wrap'), box = el('div', 'dlg card-dlg'), cv = el('canvas', 'card-cv');
+  const picked = () => all.slice(start, start + count).filter(l => l.text && l.text !== '♪');
+  const draw = extra => { [cv.width, cv.height] = CARD_SIZES[shape]; drawCard(cv, { img, lines: picked().map(l => l.text), title: t.title, artist: t.artist, ...extra }); };
+  const bar = el('div', 'card-bar'), seg = el('div', 'seg'), less = el('button', 'chip', '− line'), more = el('button', 'chip', '+ line'), up = el('button', 'chip', '↑'), down = el('button', 'chip', '↓');
+  for (const k of Object.keys(CARD_SIZES)) { const b = el('button', k === shape ? 'sel' : '', k); b.type = 'button'; b.onclick = () => { shape = k; [...seg.children].forEach(x => x.classList.toggle('sel', x === b)); draw(); }; seg.append(b); }
+  less.onclick = () => { count = Math.max(1, count - 1); draw(); };
+  more.onclick = () => { count = Math.min(4, count + 1); draw(); };
+  up.onclick = () => { start = Math.max(0, start - 1); draw(); }; up.title = 'Start one line earlier';
+  down.onclick = () => { start = Math.min(all.length - 1, start + 1); draw(); }; down.title = 'Start one line later';
+  bar.append(seg, up, down, less, more);
+  const row = el('div', 'dlg-act'), note = el('small', 'card-note'), close = el('button', 'btn ghost', 'Close'), vid = el('button', 'btn ghost', 'Make video'), share = el('button', 'btn ghost', 'Share'), savePic = el('button', 'btn', 'Save picture');
+  const name = ext => `${t.title} - lyrics.${ext}`.replace(/[\\/:*?"<>|]/g, '_');
+  const give = (blob, ext) => { const a = el('a'); a.href = URL.createObjectURL(blob); a.download = name(ext); a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 5000); };
+  const png = () => new Promise((res, rej) => { try { cv.toBlob(b => b ? res(b) : rej(new Error('Could not make the picture')), 'image/png'); } catch (e) { rej(e); } });
+  savePic.onclick = () => png().then(b => give(b, 'png'), e => toast(e.message, 'error'));
+  share.onclick = async () => {
+    try {
+      const file = new File([await png()], name('png'), { type: 'image/png' });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) await navigator.share({ files: [file], title: t.title });
+      else if (navigator.clipboard && window.ClipboardItem) { await navigator.clipboard.write([new ClipboardItem({ 'image/png': file })]); toast('Picture copied: paste it into a chat'); }
+      else give(file, 'png');
+    } catch (e) { if (e.name !== 'AbortError') toast(e.message, 'error'); }
+  };
+  vid.hidden = !(synced && t.id && window.MediaRecorder && cv.captureStream);
+  vid.onclick = async () => {
+    const lines = picked();
+    if (!lines.length) return;
+    const next = all[start + count], from = lines[0].time + lyOffset, len = Math.max(3, Math.min(20, (next ? next.time + lyOffset : lines[lines.length - 1].time + lyOffset + 4) - from));
+    ensureEq(true);
+    if (!actx || !fx) return toast('Video needs sound processing, which this browser did not allow', 'error');
+    for (const b of [vid, share, savePic, less, more, up, down]) b.disabled = true;
+    note.textContent = `Recording ${Math.round(len)} seconds with the music. Keep this window in front…`;
+    const dest = actx.createMediaStreamDestination(); fx.boost.connect(dest);
+    const stream = new MediaStream([...cv.captureStream(30).getVideoTracks(), ...dest.stream.getAudioTracks()]);
+    draw();
+    const type = await pickRecType(stream);
+    if (!type) { fx.boost.disconnect(dest); for (const b of [vid, share, savePic, less, more, up, down]) b.disabled = false; note.textContent = ''; return toast('This browser cannot record video', 'error'); }
+    const rec = new MediaRecorder(stream, { mimeType: type, videoBitsPerSecond: 6e6 }), chunks = [];
+    rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+    const finished = new Promise(res => { rec.onstop = res; });
+    audio.currentTime = Math.max(0, from - 0.35);
+    try { await actx.resume(); await audio.play(); } catch {}
+    rec.start();
+    const t0 = performance.now();
+    await new Promise(res => {
+      const step = () => {
+        const now = audio.currentTime, p = Math.max(0, Math.min(1, (now - from) / len));
+        const alpha = lines.map(l => Math.max(0, Math.min(1, (now - (l.time + lyOffset) + 0.2) / 0.45)));
+        let active = 0; lines.forEach((l, i) => { if (now >= l.time + lyOffset - 0.05) active = i; });
+        draw({ alpha, active, zoom: 1 + 0.1 * p });
+        if (now >= from + len || performance.now() - t0 > (len + 6) * 1000 || !wrap.isConnected) return res();
+        setTimeout(step, 33);  // a timer, so it keeps going if the window is covered
+      };
+      step();
+    });
+    rec.stop(); await finished;
+    audio.pause(); fx.boost.disconnect(dest);
+    for (const b of [vid, share, savePic, less, more, up, down]) b.disabled = false;
+    draw();
+    const blob = new Blob(chunks, { type: type.split(';')[0] });
+    if (!blob.size) { note.textContent = ''; return toast('The recording came out empty', 'error'); }
+    note.textContent = 'Video saved to your downloads.';
+    give(blob, type.startsWith('video/mp4') ? 'mp4' : 'webm');
+  };
+  row.append(note, close, vid, share, savePic);
+  box.append(el('h3', null, 'Lyric card'), cv, bar, row); wrap.append(box); document.body.append(wrap);
+  const done = () => wrap.remove();
+  close.onclick = done;
+  wrap.onpointerdown = e => { if (e.target === wrap) done(); };
+  wrap.onkeydown = e => { e.stopPropagation(); if (e.key === 'Escape') done(); };
+  draw();
+}
+$('lyrics').oncontextmenu = e => {
+  const p = e.target.closest('p');
+  if (!p || p.classList.contains('msg') || p.parentNode !== $('lyrics')) return;
+  e.preventDefault();
+  const i = [...$('lyrics').children].filter(x => !x.classList.contains('msg')).indexOf(p);
+  openMenu(at(e), [{ icon: 'lyrics', label: 'Make a lyric card from this line', fn: () => lyricCard(i) }], 'Lyrics');
+};
+$('lyCard').onclick = () => lyricCard(lyActive >= 0 ? lyActive : 0);
+
+// ---------------------------------------------- themes: own background picture
+function applyWall() {
+  const pic = load('wall', null);
+  document.body.classList.toggle('has-wall', !!pic);
+  root.style.setProperty('--wall', pic ? `url("${pic}")` : 'none');
+  root.style.setProperty('--wall-dim', String(prefs.wallDim ?? 0.55));
+}
+function pickWall() {
+  const inp = el('input'); inp.type = 'file'; inp.accept = 'image/*';
+  inp.onchange = () => {
+    const f = inp.files[0]; if (!f) return;
+    const im = new Image();
+    im.onload = () => {
+      // kept in this browser, scaled down so it fits its storage
+      const s = Math.min(1, 1920 / Math.max(im.width, im.height)), c = el('canvas');
+      c.width = Math.round(im.width * s); c.height = Math.round(im.height * s);
+      c.getContext('2d').drawImage(im, 0, 0, c.width, c.height);
+      try { localStorage.setItem('wall', JSON.stringify(c.toDataURL('image/jpeg', 0.82))); applyWall(); toast('Background picture set'); }
+      catch { toast('That picture is too large to keep in this browser', 'error'); }
+      URL.revokeObjectURL(im.src);
+    };
+    im.onerror = () => toast('Could not read that picture', 'error');
+    im.src = URL.createObjectURL(f);
+  };
+  inp.click();
+}
+
+// ---------------------------------------------------- custom Home shelves
+const HOME_SHELVES = { recent: 'Jump back in', videos: 'Videos', added: 'Recently added', top: 'Most played', artists: 'Your artists', folders: 'Folders' };
+function homeOrder() {
+  const saved = Array.isArray(prefs.home) ? prefs.home.filter(h => HOME_SHELVES[h.id]) : [];
+  for (const id of Object.keys(HOME_SHELVES)) if (!saved.some(h => h.id === id)) saved.push({ id, on: true });
+  return saved;
+}
+function homeDialog(redraw) {
+  const wrap = el('div', 'modal dlg-wrap'), form = el('form', 'dlg'), list = el('div', 'home-list');
+  form.append(el('h3', null, 'Your Home page'), el('p', null, 'Tick the rows you want and drag them into your order.'), list);
+  const keep = () => { prefs.home = [...list.children].map(r => ({ id: r.dataset.hid, on: r.querySelector('input').checked })); save('prefs', prefs); redraw(); };
+  for (const h of homeOrder()) {
+    const r = el('div', 'dlg-opt home-row' + (h.on ? ' sel' : '')), c = el('input'), grip = el('span', 'grip');
+    r.dataset.hid = h.id; c.type = 'checkbox'; c.checked = h.on;
+    c.onchange = () => { r.classList.toggle('sel', c.checked); keep(); };
+    grip.innerHTML = svg('more'); grip.title = 'Drag to move';
+    grip.onpointerdown = e => cardDrag(e, r, list, '.home-row', true, keep);
+    r.append(c, el('span', null, HOME_SHELVES[h.id]), grip);
+    list.append(r);
+  }
+  const row = el('div', 'dlg-act'), reset = el('button', 'btn ghost', 'Reset'), ok = el('button', 'btn', 'Done');
+  reset.type = 'button';
+  reset.onclick = () => { delete prefs.home; save('prefs', prefs); redraw(); wrap.remove(); homeDialog(redraw); };
+  row.append(reset, ok); form.append(row); wrap.append(form); document.body.append(wrap);
+  const done = () => wrap.remove();
+  wrap.onpointerdown = e => { if (e.target === wrap) done(); };
+  wrap.onkeydown = e => { e.stopPropagation(); if (e.key === 'Escape') done(); };
+  form.onsubmit = e => { e.preventDefault(); done(); };
+  ok.focus();
+}
 
 // ------------------------------------------------------------------ init
 applyPrefs();

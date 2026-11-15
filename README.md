@@ -35,6 +35,23 @@ Self-hosted web music player for your LAN. Works on desktop and phones.
 - **Clean up** (Settings → Library): finds songs saved twice and merges
   them, lists failed downloads and leftover files, and shows what uses the
   disk.
+- **Recycle bin and activity log** (Settings → Library): deleted songs and
+  folders wait 30 days in the bin and can be put back (there is also an Undo
+  button right after deleting); the log shows what was added, changed and
+  deleted, and by which profile.
+- **Profile PIN and listen-only profiles**: a profile can have a PIN, and
+  can be made listen-only for children (no downloading, deleting or
+  changing). The first profile is the owner and manages the others, so give
+  it a PIN if the others should not be able to switch to it.
+- **Themes and Home**: six looks (Dark, Light, Black, Retro, Neon, Ocean),
+  your own background picture, and a Home page whose rows you choose and
+  drag into order (Customize).
+- **Lyric cards**: right-click a lyric line (or press Card) to make a
+  picture, or a short video with the music, of one to four lines over the
+  cover.
+- **AI lyrics and longer songs** (AI add-on): when no lyrics are found, the
+  AI listens to the singing and writes synced lyrics; Remix → AI tools can
+  make a song longer at the end or add an intro.
 - **Phone**: bottom tabs, a floating mini player, swipe it up for the full
   player, sideways to change song, and swipe the full player down to close.
 
