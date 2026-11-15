@@ -615,3 +615,13 @@ input[type=range]:active::-webkit-slider-thumb{transform:scale(1.3)}
 .spin{width:14px;height:14px;border-radius:50%;border:2px solid color-mix(in srgb,var(--accent) 35%,transparent);border-top-color:var(--accent);animation:spin .8s linear infinite;flex:none}
 .st-job.queued .spin{animation:none}
 .remix button:disabled{opacity:.45;cursor:not-allowed}
+
+/* ---- folder cards: drag to reorder; "where should they go" dialog ---- */
+.card[data-id]{touch-action:pan-y;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+.card.lifting{transition:none;z-index:5;cursor:grabbing;background:var(--raise2);border-color:var(--accent);box-shadow:0 26px 60px -18px rgba(0,0,0,.8),0 0 0 3px color-mix(in srgb,var(--accent) 30%,transparent);rotate:2deg}
+.dlg label.dlg-opt{flex-direction:row;align-items:center;gap:10px;font-size:14px;color:var(--text);padding:10px 12px;border:1px solid var(--line);border-radius:12px;cursor:pointer;transition:border-color .15s,background .15s}
+.dlg label.dlg-opt.sel{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,transparent)}
+.dlg-opt input{accent-color:var(--accent);width:16px;height:16px;margin:0;padding:0}
+.dlg .dlg-sub{margin:-6px 0 0 28px;transition:opacity .15s}
+.dlg .dlg-sub.dim{opacity:.45}
+.dlg select{background:var(--raise);border:1px solid var(--line);border-radius:10px;padding:10px 12px;outline:0;font-size:14px;color:var(--text)}

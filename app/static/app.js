@@ -234,6 +234,63 @@ function dialog({ title, text, fields = [], ok = 'Save', danger = false }) {
   });
 }
 const confirmBox = (title, text, ok) => dialog({ title, text, ok, danger: true });
+// Asked before several songs are downloaded at once: a new folder, one that
+// exists already, or no folder. Resolves to what to send with the download:
+// {playlist: id}, {nofolder: true}, {} (the playlist's own folder), or null
+// when cancelled. `name` is the suggested folder name; with `own` an empty
+// name means "name it after the playlist".
+function askFolder({ title, text, name = '', own = false }) {
+  return new Promise(resolve => {
+    const wrap = el('div', 'modal dlg-wrap'), form = el('form', 'dlg');
+    form.append(el('h3', null, title));
+    if (text) form.append(el('p', null, text));
+    const opts = [];
+    const option = (key, label, extra) => {
+      const lab = el('label', 'dlg-opt'), r = el('input');
+      r.type = 'radio'; r.name = 'where'; r.value = key;
+      lab.append(r, el('span', null, label)); form.append(lab);
+      if (extra) { extra.classList.add('dlg-sub'); form.append(extra); extra.onfocus = () => { r.checked = true; paint(); }; }
+      r.onchange = () => { paint(); extra?.focus(); };
+      opts.push({ r, lab, extra });
+      return r;
+    };
+    const paint = () => opts.forEach(o => { o.lab.classList.toggle('sel', o.r.checked); if (o.extra) o.extra.classList.toggle('dim', !o.r.checked); });
+    const inp = el('input'); inp.type = 'text'; inp.value = name; inp.autocomplete = 'off';
+    inp.placeholder = own ? 'Empty = the playlist’s own name' : 'Folder name';
+    const rNew = option('new', 'A new folder', inp);
+    let sel = null, rOld = null;
+    if (state.playlists.length) {
+      sel = el('select');
+      for (const p of state.playlists) { const o = el('option', null, p.name); o.value = p.id; sel.append(o); }
+      rOld = option('old', 'A folder I already have', sel);
+    }
+    const rNone = option('none', 'No folder, just my library');
+    rNew.checked = true; paint();
+    const row = el('div', 'dlg-act'), cancel = el('button', 'btn ghost', 'Cancel'), go = el('button', 'btn', 'Download');
+    cancel.type = 'button';
+    row.append(cancel, go); form.append(row); wrap.append(form); document.body.append(wrap);
+    const done = v => { wrap.remove(); resolve(v); };
+    cancel.onclick = () => done(null);
+    wrap.onpointerdown = e => { if (e.target === wrap) done(null); };
+    wrap.onkeydown = e => { e.stopPropagation(); if (e.key === 'Escape') done(null); };
+    form.onsubmit = async e => {
+      e.preventDefault();
+      if (rNone.checked) return done({ nofolder: true });
+      if (rOld && rOld.checked) return done({ playlist: +sel.value });
+      const n = inp.value.trim();
+      if (!n && own) return done({});
+      if (!n) return inp.focus();
+      // the same name as a folder that is already there: use that one
+      const have = state.playlists.find(p => p.name.toLowerCase() === n.toLowerCase());
+      if (have) return done({ playlist: have.id });
+      if (own && n === name) return done({});
+      go.disabled = true;
+      try { const p = await post('/api/playlists', { name: n }); await loadPlaylists(); done({ playlist: p.id }); }
+      catch (err) { go.disabled = false; toast(err.message, 'error'); }
+    };
+    inp.focus(); inp.select();
+  });
+}
 
 // ---------------------------------------------------------------- menus
 function openMenu(anchor, items, title) {
@@ -420,8 +477,14 @@ function bulkMenu(list, anchor) {
     } });
   }
   if (fresh.length) items.push({ icon: 'download', label: `Download ${fresh.length} to library`, fn: async () => {
+    let dest = {};
+    if (fresh.length > 1) {
+      dest = await askFolder({ title: `Download ${fresh.length} songs`, text: 'Where should they go?' });
+      if (!dest) return;
+    }
     let ok = 0;
-    for (const t of fresh) if (await saveStream(t, null, true)) ok++;
+    for (const t of fresh) if (await saveStream(t, dest.playlist || null, true)) ok++;
+    if (dest.playlist) loadPlaylists();
     if (ok) toast(`Downloading ${ok} track${ok === 1 ? '' : 's'} to your library`);
   } });
   items.push({ icon: 'folder', label: lib.length === list.length ? 'Add to folder…' : 'Download to folder…', fn: a => folderPicker(list, a) });
@@ -912,9 +975,87 @@ function renderFolders() {
     const t = el('div', 'tile'); t.style.background = grad(p.name); t.innerHTML = svg(p.source === 'folder' ? 'folder' : 'music');
     c.append(t, el('b', null, p.name), el('small', null, `${p.count} track${p.count === 1 ? '' : 's'}${p.source === 'folder' ? '' : ' · ' + p.source}`));
     c.onclick = () => go({ type: 'playlist', id: p.id, name: p.name, source: p.source });
+    c.dataset.id = p.id; c.title = 'Drag to move this folder';
+    c.onpointerdown = e => cardDrag(e, c, grid);
     grid.append(c);
   });
   main.append(grid);
+}
+// Drag a folder card on the Folders page to put the folders in any order
+// (press and hold it first on a touch screen). The other cards slide aside.
+function cardDrag(e, c, grid) {
+  const touch = e.pointerType !== 'mouse';
+  if (!touch && e.button !== 0) return;
+  e.stopPropagation();
+  const x0 = e.clientX, y0 = e.clientY, main = $('main');
+  let on = false, gx = 0, gy = 0, lock = 0, last = e, timer = 0, raf = 0;
+  const others = () => [...grid.querySelectorAll('.card[data-id]')].filter(x => x !== c);
+  const follow = () => {  // keep the card under the pointer wherever it sits in the grid
+    c.style.transform = '';
+    const r = c.getBoundingClientRect();
+    c.style.transform = `translate(${last.clientX - gx - r.left}px,${last.clientY - gy - r.top}px) scale(1.06)`;
+  };
+  const start = () => {
+    c.style.animation = 'none';
+    c.classList.add('lifting');
+    const r = c.getBoundingClientRect();
+    gx = last.clientX - r.left; gy = last.clientY - r.top;
+    on = plDrag = true;
+    try { c.setPointerCapture(e.pointerId); } catch {}
+    follow();
+    raf = requestAnimationFrame(scroll);
+  };
+  const scroll = () => {  // near the top or bottom edge the page keeps scrolling
+    const m = main.getBoundingClientRect(), y = last.clientY;
+    const step = y < m.top + 40 ? -14 : y > m.bottom - 40 ? 14 : 0;
+    if (step) { main.scrollBy({ top: step, behavior: 'instant' }); place(); }
+    raf = requestAnimationFrame(scroll);
+  };
+  const place = () => {
+    follow();
+    if (performance.now() < lock) return;
+    const x = last.clientX, y = last.clientY;
+    const hit = others().find(o => { const r = o.getBoundingClientRect(); return x > r.left && x < r.right && y > r.top && y < r.bottom; });
+    if (!hit) return;
+    const list = others(), was = new Map(list.map(o => [o, o.getBoundingClientRect()]));
+    const after = c.compareDocumentPosition(hit) & Node.DOCUMENT_POSITION_FOLLOWING;
+    grid.insertBefore(c, after ? hit.nextSibling : hit);
+    for (const o of list) {
+      const a = was.get(o), b = o.getBoundingClientRect();
+      if (a.left !== b.left || a.top !== b.top) o.animate([{ transform: `translate(${a.left - b.left}px,${a.top - b.top}px)` }, { transform: 'none' }], { duration: 220, easing: 'cubic-bezier(.2,.8,.2,1)' });
+    }
+    lock = performance.now() + 240;
+    follow();
+  };
+  const move = ev => {
+    last = ev;
+    if (!on) {
+      const far = Math.hypot(ev.clientX - x0, ev.clientY - y0);
+      if (touch) { if (far > 10) clearTimeout(timer); return; }  // moved before the hold: a scroll
+      if (far < 6) return;
+      start();
+    }
+    place();
+  };
+  const noScroll = ev => { if (on) ev.preventDefault(); };
+  const noMenu = ev => { if (on || touch) ev.preventDefault(); };
+  const up = async () => {
+    clearTimeout(timer); cancelAnimationFrame(raf);
+    for (const k of ['pointermove', 'pointerup', 'pointercancel']) c.removeEventListener(k, k === 'pointermove' ? move : up);
+    c.removeEventListener('touchmove', noScroll); c.removeEventListener('contextmenu', noMenu);
+    if (!on) return;
+    dragEnd = performance.now();  // the click that ends the drag must not open the folder
+    c.classList.remove('lifting'); c.style.transform = '';
+    const ids = [...grid.querySelectorAll('.card[data-id]')].map(x => +x.dataset.id);
+    state.playlists.sort((x, y) => ids.indexOf(x.id) - ids.indexOf(y.id));
+    try { await api('/api/playlists/order', { method: 'PUT', body: { ids } }); }
+    catch (err) { toast(err.message, 'error'); }
+    plDrag = false;
+    loadPlaylists();
+  };
+  c.addEventListener('pointermove', move); c.addEventListener('pointerup', up); c.addEventListener('pointercancel', up);
+  c.addEventListener('touchmove', noScroll, { passive: false }); c.addEventListener('contextmenu', noMenu);
+  if (touch) timer = setTimeout(() => { start(); navigator.vibrate?.(15); }, 350);
 }
 
 // Each artist name in a line of text opens that artist's page.
@@ -1352,8 +1493,13 @@ function renderSpotify() {
   if (!d) return main.append(el('div', 'empty', 'Reading the link…'));
   const chosen = () => d.tracks.filter(t => !s.skip.has(t.id));
   const dl = btn('btn', 'download', 'Download', async () => {
+    let dest = {};
+    if (d.kind !== 'track' && chosen().length > 1) {
+      dest = await askFolder({ title: `Download ${chosen().length} songs`, text: `Where should the songs from “${d.name}” go?`, name: d.name, own: true });
+      if (!dest) return;
+    }
     try {
-      await post('/api/import', { url: s.url, kind: 'video', skip: [...s.skip] });
+      await post('/api/import', { url: s.url, kind: 'video', skip: [...s.skip], ...dest });
       toast(`Downloading ${chosen().length} song(s) from “${d.name}”`);
       state.wasPending = true; state.spotify = null;
       go({ type: 'library' });
@@ -1384,8 +1530,14 @@ $('form').onsubmit = async e => {
   $('q').blur();
   if (/open\.spotify\.com\//i.test(q)) { $('q').value = ''; return previewSpotify(/^https?:/i.test(q) ? q : 'https://' + q); }
   if (/^https?:\/\//i.test(q)) {
+    // a link to a whole playlist or channel: ask which folder it goes to
+    let dest = {};
+    if (!/watch\?v=|youtu\.be\/|\/shorts\//i.test(q)) {
+      dest = await askFolder({ title: 'Download this playlist', text: 'Where should its songs go? Songs without a video are saved as sound only.', own: true });
+      if (!dest) return;
+    }
     try {
-      await post('/api/import', { url: q, kind: 'video' });
+      await post('/api/import', { url: q, kind: 'video', ...dest });
       toast('Importing… tracks appear as they download');
       $('q').value = ''; state.wasPending = true;
       if (state.view.type !== 'library') go({ type: 'library' });

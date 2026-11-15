@@ -54,7 +54,11 @@ Self-hosted web music player for your LAN. Works on desktop and phones.
   own audio files (mp3, m4a, flac, wav, ogg, opus…). Tags and embedded cover
   art are read automatically.
 - **Folders**: create folders, add any track to them from the ⋯ menu, upload
-  straight into a folder. Imported playlists show up here too.
+  straight into a folder. Imported playlists show up here too. Drag a folder
+  (in the sidebar or on the Folders page) to put the folders in any order.
+  When several songs are downloaded at once (a playlist link, a Spotify
+  album, or a selection of search results) the player asks whether they go
+  into a new folder, one you already have, or no folder.
 - **Lyrics**: fetched from LRCLIB, shown in the Now Playing screen. Synced
   lyrics highlight and scroll with the song; tap a line to jump to it. Lyrics
   can be saved as `.lrc`.

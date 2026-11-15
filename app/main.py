@@ -725,7 +725,21 @@ def yt_ext(video_id: str, kind: str) -> str:
     return "yt:" + video_id
 
 
-def do_import(url: str, kind: str = "video", skip=()):
+def place(ids, name, url, source, playlist, nofolder):
+    """Where a multi-song import goes: a chosen folder, none, or its own."""
+    if playlist:
+        with db() as con:
+            if con.execute("SELECT 1 FROM playlists WHERE id=?",
+                           (playlist,)).fetchone():
+                for tid in ids:
+                    playlist_append(con, playlist, tid)
+                return
+    if not nofolder:
+        make_playlist(name, url, source, ids)
+
+
+def do_import(url: str, kind: str = "video", skip=(), playlist=None,
+              nofolder=False):
     m = SPOTIFY_RE.search(url)
     if m:
         kind, sid = m.groups()
@@ -733,8 +747,9 @@ def do_import(url: str, kind: str = "video", skip=()):
         tracks = [t for t in tracks if t["id"] not in set(skip)]
         ids = [add_track(f"sp:{t['id']}", t["title"], t["artist"],
                          t["duration"], "spotify") for t in tracks if t["id"]]
-        if kind != "track":
-            make_playlist(name, f"spotify:{kind}:{sid}", "spotify", ids)
+        if kind != "track" or playlist:
+            place(ids, name, f"spotify:{kind}:{sid}", "spotify", playlist,
+                  nofolder or kind == "track")
         notify(f"Spotify: queued {len(ids)} track(s) from “{name}”")
         return
     single = "watch?v=" in url or "youtu.be/" in url or "/shorts/" in url
@@ -749,12 +764,15 @@ def do_import(url: str, kind: str = "video", skip=()):
                                      t["artist"], t["duration"], "youtube",
                                      t["video_id"], kind))
         name = info.get("title") or "YouTube playlist"
-        make_playlist(name, f"youtube:{info.get('id') or url}", "youtube", ids)
+        place(ids, name, f"youtube:{info.get('id') or url}", "youtube",
+              playlist, nofolder)
         notify(f"YouTube: queued {len(ids)} track(s) from “{name}”")
     else:
         t = entry_dict(info)
-        add_track(yt_ext(t["video_id"], kind), t["title"], t["artist"],
-                  t["duration"], "youtube", t["video_id"], kind)
+        tid = add_track(yt_ext(t["video_id"], kind), t["title"], t["artist"],
+                        t["duration"], "youtube", t["video_id"], kind)
+        if playlist:
+            place([tid], "", "", "youtube", playlist, True)
         notify(f"Queued “{t['title']}”")
 
 
@@ -1005,6 +1023,8 @@ class ImportReq(BaseModel):
     url: str
     kind: str = "video"
     skip: list[str] = []  # Spotify track ids to leave out
+    playlist: int | None = None  # put the songs into this existing folder
+    nofolder: bool = False       # library only, make no folder
 
 
 class LikeReq(BaseModel):
@@ -1257,7 +1277,7 @@ def import_url(req: ImportReq):
     if not ok:
         raise HTTPException(400, "Only YouTube and Spotify links are supported")
     jobs.put(("import", (url, "video" if req.kind == "video" else "audio",
-                         tuple(req.skip))))
+                         tuple(req.skip), req.playlist, req.nofolder)))
     return {"ok": True}
 
 
