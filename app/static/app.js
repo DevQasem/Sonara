@@ -348,7 +348,7 @@ function openMenu(anchor, items, title) {
   menu.style.left = Math.max(8, Math.min(anchor.point ? r.left : r.right - w, innerWidth - w - 8)) + 'px';
   menu.style.top = (r.bottom + h + 8 > innerHeight ? Math.max(8, r.top - h - 4) : r.bottom + 4) + 'px';
 }
-function closeMenu() { $('menu').hidden = $('scrim').hidden = true; }
+function closeMenu() { document.querySelectorAll('.menu-on').forEach(n => n.classList.remove('menu-on')); $('menu').hidden = $('scrim').hidden = true; }
 $('scrim').onclick = closeMenu;
 $('scrim').onpointerdown = e => { if (e.button === 0) closeMenu(); };
 // Right-click while a menu is open: close it and open the menu of whatever is
@@ -974,7 +974,7 @@ async function loadPlaylists() {
     b.innerHTML = svg('folder'); b.append(el('span', null, p.name), el('small', null, p.count));
     b.onclick = () => go({ type: 'playlist', id: p.id, name: p.name, source: p.source });
     b.onpointerdown = e => cardDrag(e, b, box, ".nav", true);
-    b.oncontextmenu = e => { e.preventDefault(); folderMenu(p, at(e)); };
+    b.oncontextmenu = e => { e.preventDefault(); folderMenu(p, at(e), b); };
     if (state.pulse === p.id) b.classList.add('got');  // songs were just dropped in
     box.append(b);
   }
@@ -982,7 +982,7 @@ async function loadPlaylists() {
   setActive();
 }
 // Right-click menu of a folder, in the sidebar and on the Folders page.
-function folderMenu(p, anchor) {
+function folderMenu(p, anchor, mark) {
   const here = () => state.view.type === 'playlist' && state.view.id === p.id;
   const redraw = async () => { await loadPlaylists(); if (state.view.type === 'folders') renderFolders(); };
   const play = async mix => {
@@ -1010,6 +1010,8 @@ function folderMenu(p, anchor) {
       if (here()) go({ type: 'folders' }); else redraw();
     } },
   ], p.name);
+  document.querySelectorAll('.menu-on').forEach(n => n.classList.remove('menu-on'));
+  mark?.classList.add('menu-on');  // shows which folder the menu belongs to, until it closes
 }
 // True while a folder is being dragged (sidebar or Folders page).
 let plDrag = false;
@@ -1039,7 +1041,7 @@ function renderFolders() {
     c.onclick = () => go({ type: 'playlist', id: p.id, name: p.name, source: p.source });
     c.dataset.id = p.id; c.title = 'Drag to move this folder';
     c.onpointerdown = e => cardDrag(e, c, grid);
-    c.oncontextmenu = e => { e.preventDefault(); folderMenu(p, at(e)); };
+    c.oncontextmenu = e => { e.preventDefault(); folderMenu(p, at(e), c); };
     grid.append(c);
   });
   main.append(grid);
