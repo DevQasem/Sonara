@@ -7,7 +7,7 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<title>Homelab Music</title>
+<title>Music Player</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎵</text></svg>">
 <link rel="stylesheet" href="style.css">
 </head>
@@ -65,8 +65,9 @@
     <button class="icon-btn heart" id="likeBtn" title="Like" hidden><i data-ico="heartLine"></i></button>
     <button class="icon-btn" id="lyricsBtn" title="Lyrics"><i data-ico="lyrics"></i></button>
     <button class="icon-btn" id="queueBtn" title="Queue"><i data-ico="queue"></i></button>
+    <button class="icon-btn" id="fxBtn" title="Effects: slowed, reverb, 8D"><i data-ico="tune"></i></button>
     <i data-ico="volume"></i>
-    <input id="vol" type="range" min="0" max="1" step="0.01" value="1" aria-label="Volume">
+    <input id="vol" type="range" min="0" max="2" step="0.01" value="1" aria-label="Volume">
   </div>
 </footer>
 
@@ -103,6 +104,7 @@
         <button class="icon-btn" id="npQueue" title="Queue"><i data-ico="queue"></i></button>
         <button class="icon-btn" id="fsBtn" title="Full screen" hidden><i data-ico="fullscreen"></i></button>
       </div>
+      <div id="npFx"></div>
       <button class="btn" id="npSave" hidden><i data-ico="download"></i><span>Download to library</span></button>
       <div class="seek"><span class="js-cur">0:00</span><input class="js-seek" type="range" min="0" max="1" step="0.1" value="0" aria-label="Seek"><span class="js-dur">0:00</span></div>
       <div class="b">

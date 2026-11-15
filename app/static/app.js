@@ -77,8 +77,7 @@ function applyPrefs() {
   document.body.classList.toggle('viz-circle', prefs.viz === 'circle');
   document.body.classList.toggle('viz-off', prefs.viz === 'off');
   applyRemix();
-  audio.volume = prefs.volume;
-  $('vol').value = prefs.volume; fill($('vol'));
+  setVolume(prefs.volume);
   applyEq();
   save('prefs', prefs);
   themeFromCover(current() || null);
@@ -146,6 +145,43 @@ function applyRemix() {
   audio.playbackRate = remix.speed !== 1 ? remix.speed : prefs.speed;
   if (remixOn()) { ensureEq(); actx?.resume(); }
   if (fx) { fx.bass.gain.value = remix.bass; fx.wet.gain.value = remix.reverb * 0.7; fx.depth.gain.value = remix.pan ? 1 : 0; }
+  paintFx();
+}
+// Quick effect buttons in the player: one click and the playing song
+// changes straight away. They stay on from song to song until switched off.
+const FX = [
+  ['Slowed', () => remix.speed < 1, () => { remix.speed = remix.speed < 1 ? 1 : 0.85; }],
+  ['Sped up', () => remix.speed > 1, () => { remix.speed = remix.speed > 1 ? 1 : 1.2; }],
+  ['Reverb', () => remix.reverb > 0, () => { remix.reverb = remix.reverb ? 0 : 0.5; }],
+  ['Bass', () => remix.bass > 0, () => { remix.bass = remix.bass ? 0 : 8; }],
+  ['8D', () => remix.pan, () => { remix.pan = !remix.pan; }],
+];
+function fxChips(box) {
+  box.classList.add('fx-chips');
+  const changed = () => { remixNamed = false; applyRemix(); if (state.view.type === 'remix' && paintRemix) paintRemix(); };
+  for (const [label, on, flip] of FX) {
+    const b = el('button', 'chip', label); b.type = 'button'; b._on = on;
+    b.onclick = e => { e.stopPropagation(); flip(); changed(); };
+    box.append(b);
+  }
+  const off = el('button', 'chip fx-off', 'Off'); off.type = 'button'; off.title = 'Back to the original sound';
+  off.onclick = e => { e.stopPropagation(); resetRemix(); };
+  box.append(off);
+}
+function paintFx() {
+  document.querySelectorAll('.fx-chips .chip').forEach(b => { if (b._on) b.classList.toggle('sel', b._on()); else b.hidden = !remixOn(); });
+  document.getElementById('fxBtn')?.classList.toggle('on', remixOn());
+}
+// Volume goes past 100%: up to there it is the normal volume, above it the
+// sound is made louder than the original (it can distort on loud songs).
+function setVolume(v) {
+  if (Math.abs(v - 1) < 0.04) v = 1;  // easy to land on exactly 100%
+  prefs.volume = v; audio.volume = Math.min(v, 1);
+  if (v > 1) { ensureEq(); actx?.resume(); }
+  if (fx) fx.boost.gain.value = Math.max(v, 1);
+  const r = document.getElementById('vol');
+  r.value = v; fill(r); r.classList.toggle('boost', v > 1);
+  r.title = `Volume ${Math.round(v * 100)}%` + (v > 1 ? ' — louder than the original' : '');
 }
 const state = {
   view: { type: 'library' }, tracks: [], shown: [], tracksKey: '', filter: '',
@@ -392,7 +428,6 @@ function stopPlayer() {
   $('npBg').style.backgroundImage = '';
   $('saveBtn').hidden = $('npSave').hidden = $('likeBtn').hidden = $('npLike').hidden = $('fsBtn').hidden = true;
   document.body.classList.remove('is-video'); $('avTabs').hidden = true;
-  document.title = 'Homelab Music';
   renderQueue();
   if (wide()) { $('np').classList.remove('full'); showLyrics(); } else closeNp();
   markCurrent();
@@ -914,43 +949,15 @@ async function loadPlaylists() {
     const b = el('button', 'nav'); b.dataset.id = p.id;
     b.innerHTML = svg('folder'); b.append(el('span', null, p.name), el('small', null, p.count));
     b.onclick = () => go({ type: 'playlist', id: p.id, name: p.name, source: p.source });
-    b.onpointerdown = e => folderDrag(e, b);
+    b.onpointerdown = e => cardDrag(e, b, box, ".nav", true);
     if (state.pulse === p.id) b.classList.add('got');  // songs were just dropped in
     box.append(b);
   }
   state.pulse = null;
   setActive();
 }
-// Drag a folder up or down in the sidebar to put the folders in any order.
+// True while a folder is being dragged (sidebar or Folders page).
 let plDrag = false;
-function folderDrag(e, b) {
-  if (e.button !== 0 || e.pointerType !== 'mouse') return;
-  const box = $('pls'), y0 = e.clientY;
-  let moved = false;
-  b.setPointerCapture(e.pointerId);
-  const move = ev => {
-    if (!moved) {
-      if (Math.abs(ev.clientY - y0) < 6) return;
-      moved = plDrag = true; b.classList.add('lifting');
-    }
-    const before = [...box.children].find(c => c !== b && ev.clientY < c.getBoundingClientRect().top + c.offsetHeight / 2);
-    box.insertBefore(b, before || null);
-  };
-  const up = async () => {
-    b.removeEventListener('pointermove', move); b.removeEventListener('pointerup', up); b.removeEventListener('pointercancel', up);
-    if (!moved) return;
-    b.classList.remove('lifting');
-    dragEnd = performance.now();  // the click that ends the drag must not open the folder
-    const ids = [...box.children].map(c => +c.dataset.id);
-    state.playlists.sort((x, y) => ids.indexOf(x.id) - ids.indexOf(y.id));
-    try { await api('/api/playlists/order', { method: 'PUT', body: { ids } }); }
-    catch (err) { toast(err.message, 'error'); }
-    plDrag = false;
-    await loadPlaylists();
-    if (state.view.type === 'folders') renderFolders();
-  };
-  b.addEventListener('pointermove', move); b.addEventListener('pointerup', up); b.addEventListener('pointercancel', up);
-}
 
 function renderFolders() {
   const main = $('main'); main.replaceChildren();
@@ -983,17 +990,17 @@ function renderFolders() {
 }
 // Drag a folder card on the Folders page to put the folders in any order
 // (press and hold it first on a touch screen). The other cards slide aside.
-function cardDrag(e, c, grid) {
+function cardDrag(e, c, grid, sel = ".card[data-id]", col = false) {
   const touch = e.pointerType !== 'mouse';
   if (!touch && e.button !== 0) return;
   e.stopPropagation();
   const x0 = e.clientX, y0 = e.clientY, main = $('main');
   let on = false, gx = 0, gy = 0, lock = 0, last = e, timer = 0, raf = 0;
-  const others = () => [...grid.querySelectorAll('.card[data-id]')].filter(x => x !== c);
+  const others = () => [...grid.querySelectorAll(sel)].filter(x => x !== c);
   const follow = () => {  // keep the card under the pointer wherever it sits in the grid
     c.style.transform = '';
     const r = c.getBoundingClientRect();
-    c.style.transform = `translate(${last.clientX - gx - r.left}px,${last.clientY - gy - r.top}px) scale(1.06)`;
+    c.style.transform = col ? `translateY(${last.clientY - gy - r.top}px) scale(1.03)` : `translate(${last.clientX - gx - r.left}px,${last.clientY - gy - r.top}px) scale(1.06)`;
   };
   const start = () => {
     c.style.animation = 'none';
@@ -1015,7 +1022,7 @@ function cardDrag(e, c, grid) {
     follow();
     if (performance.now() < lock) return;
     const x = last.clientX, y = last.clientY;
-    const hit = others().find(o => { const r = o.getBoundingClientRect(); return x > r.left && x < r.right && y > r.top && y < r.bottom; });
+    const hit = others().find(o => { const r = o.getBoundingClientRect(); return (col || (x > r.left && x < r.right)) && y > r.top && y < r.bottom; });
     if (!hit) return;
     const list = others(), was = new Map(list.map(o => [o, o.getBoundingClientRect()]));
     const after = c.compareDocumentPosition(hit) & Node.DOCUMENT_POSITION_FOLLOWING;
@@ -1045,13 +1052,16 @@ function cardDrag(e, c, grid) {
     c.removeEventListener('touchmove', noScroll); c.removeEventListener('contextmenu', noMenu);
     if (!on) return;
     dragEnd = performance.now();  // the click that ends the drag must not open the folder
+    const from = c.style.transform;
     c.classList.remove('lifting'); c.style.transform = '';
-    const ids = [...grid.querySelectorAll('.card[data-id]')].map(x => +x.dataset.id);
+    const drop = c.animate([{ transform: from }, { transform: 'none' }], { duration: 200, easing: 'cubic-bezier(.2,.8,.2,1)' });  // settle into the gap
+    const ids = [...grid.querySelectorAll(sel)].map(x => +x.dataset.id);
     state.playlists.sort((x, y) => ids.indexOf(x.id) - ids.indexOf(y.id));
     try { await api('/api/playlists/order', { method: 'PUT', body: { ids } }); }
     catch (err) { toast(err.message, 'error'); }
     plDrag = false;
-    loadPlaylists();
+    if (col) { await settle(drop, 200); await loadPlaylists(); if (state.view.type === 'folders') renderFolders(); }
+    else loadPlaylists();
   };
   c.addEventListener('pointermove', move); c.addEventListener('pointerup', up); c.addEventListener('pointercancel', up);
   c.addEventListener('touchmove', noScroll, { passive: false }); c.addEventListener('contextmenu', noMenu);
@@ -1706,7 +1716,7 @@ function playIndex(i, autoplay = true, startAt = 0) {
     return;
   }
   if (!t.id && t.kind === 'video') t.vsrc = true;
-  resetRemix();  // a remix preview belongs to the song it was made on
+  remixNamed = false; if (state.view.type === 'remix' && paintRemix) paintRemix();  // effects stay on for the next song
   audio.src = srcOf(t);
   applyRemix();
   if (startAt) audio.addEventListener('loadedmetadata', () => { audio.currentTime = startAt; }, { once: true });
@@ -1723,7 +1733,6 @@ function playIndex(i, autoplay = true, startAt = 0) {
   setImg($('art'), t); setImg($('npArt'), t);
   $('npBg').style.backgroundImage = `url("${coverUrl(t)}")`;
   themeFromCover(t);
-  document.title = `${t.title} · Homelab Music`;
   if ('mediaSession' in navigator) {
     navigator.mediaSession.metadata = new MediaMetadata({ title: t.title, artist: t.artist || '', artwork: [{ src: coverUrl(t), sizes: '320x180' }] });
   }
@@ -1799,7 +1808,6 @@ audio.ontimeupdate = () => {
   syncLyrics(t);
   const cur = current();
   if (cur && cur.id && !cur.counted && t > 10) { cur.counted = true; post(`/api/tracks/${cur.id}/played`).catch(() => {}); state.tracksKey = ''; }
-  if (prefs.resume && current()?.id && Date.now() - lastSave > 4000) { lastSave = Date.now(); save('last', { id: current().id, time: t }); }
 };
 audio.ondurationchange = () => {
   const d = isFinite(audio.duration) ? audio.duration : 0;
@@ -1810,7 +1818,7 @@ $$('.js-seek').forEach(s => {
   s.oninput = () => { seeking = true; fill(s); $$('.js-cur').forEach(e => { e.textContent = fmt(s.value); }); };
   s.onchange = () => { audio.currentTime = s.value; seeking = false; };
 });
-$('vol').oninput = () => { prefs.volume = audio.volume = +$('vol').value; fill($('vol')); save('prefs', prefs); };
+$('vol').oninput = () => { setVolume(+$('vol').value); save('prefs', prefs); };
 $$('.js-play').forEach(b => { b.onclick = toggle; });
 $$('.js-next').forEach(b => { b.onclick = () => next(); });
 $$('.js-prev').forEach(b => { b.onclick = prev; });
@@ -1848,7 +1856,7 @@ let actx, eqNodes, analyser;
 const npOpen = () => $('np').classList.contains('open');
 function ensureEq() {
   const wantEq = prefs.eqOn && prefs.eq.some(g => g), wantViz = prefs.viz !== 'off' && npOpen() && !!current();
-  if (actx || !(wantEq || wantViz || remixOn())) return;
+  if (actx || !(wantEq || wantViz || remixOn() || prefs.volume > 1)) return;
   try {
     actx = new (window.AudioContext || window.webkitAudioContext)();
     let node = actx.createMediaElementSource(audio);
@@ -1869,8 +1877,9 @@ function ensureEq() {
     verb.buffer = ir; wet.gain.value = 0; depth.gain.value = 0; lfo.frequency.value = 0.09;
     lfo.connect(depth); depth.connect(pan.pan); lfo.start();
     node.connect(bass); bass.connect(pan); pan.connect(analyser); pan.connect(verb); verb.connect(wet); wet.connect(analyser);
-    analyser.connect(actx.destination);
-    fx = { bass, wet, depth };
+    const boost = actx.createGain(); boost.gain.value = Math.max(prefs.volume, 1);
+    analyser.connect(boost); boost.connect(actx.destination);
+    fx = { bass, wet, depth, boost };
     if (remixOn()) applyRemix();
     applyEq();
     if (!audio.paused) actx.resume();
@@ -2239,7 +2248,6 @@ async function renderSettings() {
   <div class="box" data-cat="playback"><h3>Listening</h3>
     <div class="field"><div><b>Speed</b><small id="spdLbl"></small></div><input type="range" id="setSpeed" min="0.5" max="2" step="0.05"></div>
     <div class="field"><div><b>Sleep timer</b><small>Pause playback automatically</small></div><select id="setSleep"><option value="off">Off</option><option value="15">15 minutes</option><option value="30">30 minutes</option><option value="45">45 minutes</option><option value="60">1 hour</option><option value="end">End of this track</option></select></div>
-    <div class="field"><div><b>Resume where I left off</b><small>Reopen the last track and position</small></div>${sw('setResume')}</div>
   </div>
   <div class="box" data-cat="playback"><h3>Keyboard &amp; mouse</h3>
     <div class="field"><div><small><kbd>Space</kbd> play/pause · <kbd>←</kbd> <kbd>→</kbd> seek 5s · <kbd>N</kbd> next · <kbd>P</kbd> previous · <kbd>L</kbd> lyrics · <kbd>Q</kbd> queue · <kbd>/</kbd> search · right-click a track for its menu · drag across the list to select, <kbd>Ctrl</kbd>/<kbd>Shift</kbd>-click to add, <kbd>Ctrl</kbd>+<kbd>A</kbd> for all · drag tracks onto a folder to put them there</small></div></div>
@@ -2299,7 +2307,7 @@ async function renderSettings() {
   custom.oninput = () => { prefs.accent = custom.value; applyPrefs(); paintSw(); };
   sws.append(custom); paintSw();
   const bind = (id, key) => { const c = $(id); c.checked = prefs[key]; c.onchange = () => { prefs[key] = c.checked; applyPrefs(); }; };
-  bind('setAnim', 'anim'); bind('setCompact', 'compact'); bind('setResume', 'resume'); bind('setCover', 'coverTheme');
+  bind('setAnim', 'anim'); bind('setCompact', 'compact'); bind('setCover', 'coverTheme');
   const vz = $('setViz');
   const paintVz = () => vz.querySelectorAll('button').forEach(b => b.classList.toggle('sel', b.dataset.v === prefs.viz));
   vz.onclick = e => { const v = e.target.dataset.v; if (!v) return; prefs.viz = v; applyPrefs(); paintVz(); vizStart(); };
@@ -2422,6 +2430,24 @@ onSwipe($('np'), (dx, dy, from) => {
   else if (Math.abs(dx) > 70 && Math.abs(dx) > Math.abs(dy) * 1.5 && from.closest('.art-wrap')) dx < 0 ? next() : prev();
 });
 
+// Effect buttons: a row in the Now Playing panel and a pop-up on the bar.
+fxChips($('npFx'));
+{
+  const pop = el('div', 'fx-pop'); pop.hidden = true;
+  pop.append(el('b', null, 'Effects')); const row = el('div'); fxChips(row); pop.append(row);
+  document.body.append(pop);
+  $('fxBtn').onclick = e => {
+    e.stopPropagation();
+    pop.hidden = !pop.hidden;
+    if (pop.hidden) return;
+    const r = $('fxBtn').getBoundingClientRect();
+    pop.style.bottom = innerHeight - r.top + 12 + 'px';
+    pop.style.right = Math.max(8, innerWidth - r.right - 60) + 'px';
+  };
+  document.addEventListener('pointerdown', e => { if (!pop.hidden && !pop.contains(e.target) && !$('fxBtn').contains(e.target)) pop.hidden = true; }, true);
+  paintFx();
+}
+
 // ------------------------------------------------------------------ init
 applyPrefs();
 $$('input[type=range]').forEach(fill);
@@ -2429,11 +2455,6 @@ if (wide() && prefs.panel) openNp();
 (async () => {
   try { const a = await api('/api/auth'); if (a.required && !a.authed) return showLogin(); } catch {}
   await go({ type: 'home' });
-  const last = prefs.resume && load('last', null);
-  if (last) {
-    const q = (state.home?.all || []).filter(t => t.status === 'ready');
-    const i = q.findIndex(t => t.id === last.id);
-    if (i >= 0) { state.queue = q; playIndex(i, false, last.time || 0); }
-  }
+  try { localStorage.removeItem('last'); } catch {}  // nothing is remembered between visits
   poll();
 })();

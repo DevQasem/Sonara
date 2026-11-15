@@ -20,6 +20,9 @@ Self-hosted web music player for your LAN. Works on desktop and phones.
   new song. With the AI add-on: split vocals from music, make a **mashup**
   (the music of one song with the vocals of up to three others, matched in
   tempo and key), or create a short instrumental from a description.
+- **Live effects and louder volume**: the effects button on the player bar
+  (and the row under the cover) switches Slowed, Sped up, Reverb, Bass and
+  8D on the playing song at once. The volume slider goes up to 200%.
 - **Phone**: bottom tabs, a floating mini player, swipe it up for the full
   player, sideways to change song, and swipe the full player down to close.
 
@@ -63,7 +66,7 @@ Self-hosted web music player for your LAN. Works on desktop and phones.
   lyrics highlight and scroll with the song; tap a line to jump to it. Lyrics
   can be saved as `.lrc`.
 - **Settings**: theme, accent colour, animated background, compact rows,
-  playback speed, 3-band equaliser, sleep timer, resume last track, download
+  playback speed, 3-band equaliser, sleep timer, download
   format, automatic lyrics, Spotify credentials, library stats.
 
 ## Install
