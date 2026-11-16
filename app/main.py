@@ -70,6 +70,7 @@ _event_lock = threading.Lock()
 def db():
     con = sqlite3.connect(DB, timeout=30)
     con.row_factory = sqlite3.Row
+    con.create_function("cur_profile", 0, profile_id)
     try:
         yield con
         con.commit()
@@ -100,6 +101,12 @@ def init_db():
         CREATE TABLE IF NOT EXISTS artists(
             name TEXT PRIMARY KEY, data TEXT, fetched REAL);
         CREATE TABLE IF NOT EXISTS profiles(id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE IF NOT EXISTS library(
+            profile_id INTEGER, track_id INTEGER,
+            PRIMARY KEY(profile_id, track_id));
+        CREATE TRIGGER IF NOT EXISTS own_new_track AFTER INSERT ON tracks BEGIN
+            INSERT OR IGNORE INTO library VALUES(cur_profile(), NEW.id);
+        END;
         CREATE TABLE IF NOT EXISTS profile_keys(
             token TEXT PRIMARY KEY, profile_id INTEGER);
         CREATE TABLE IF NOT EXISTS activity(
@@ -137,6 +144,13 @@ def init_db():
                           ("gain", "REAL")):
             if name not in cols:
                 con.execute(f"ALTER TABLE tracks ADD COLUMN {name} {ddl}")
+        # Each profile has its own library. Songs from before that split all
+        # go to the first profile.
+        if not con.execute("SELECT 1 FROM settings WHERE key='library_split'"
+                           ).fetchone():
+            con.execute("INSERT OR IGNORE INTO library SELECT 1,id FROM tracks")
+            con.execute("INSERT OR REPLACE INTO settings VALUES"
+                        "('library_split','1')")
         # Likes and play counts belong to a profile. The first profile takes
         # over what was counted before profiles existed.
         if not con.execute("SELECT 1 FROM profiles").fetchone():
@@ -790,6 +804,8 @@ def add_track(ext_id, title, artist, duration, source, video_id=None,
              time.time(), raw_title, raw_artist))
         row = con.execute("SELECT id,status,kind FROM tracks WHERE ext_id=?",
                           (ext_id,)).fetchone()
+        con.execute("INSERT OR IGNORE INTO library VALUES(?,?)",
+                    (profile_id(), row["id"]))
         enqueue = bool(cur.rowcount)
         if not enqueue and kind == "video" and row["kind"] != "video":
             con.execute("UPDATE tracks SET kind='video',status='queued',"
@@ -1008,6 +1024,8 @@ def process_track(tid: int):
 def worker():
     while True:
         kind, arg = jobs.get()
+        _profile.set(arg[5] if kind == "import" and len(arg) > 5 else
+                     arg.get("profile", 1) if kind == "ai" else 1)
         try:
             if kind == "import":
                 do_import(*arg)
@@ -1251,8 +1269,10 @@ def track_cols() -> str:
 
 def tracks_from() -> str:
     """The tracks table with the current profile's likes and play counts."""
-    return ("tracks t LEFT JOIN profile_tracks pt ON pt.track_id=t.id AND "
-            f"pt.profile_id={profile_id()}")
+    p = profile_id()
+    return (f"tracks t JOIN library lb ON lb.track_id=t.id AND lb.profile_id={p} "
+            "LEFT JOIN profile_tracks pt ON pt.track_id=t.id AND "
+            f"pt.profile_id={p}")
 
 
 @app.get("/api/library/search")
@@ -1303,7 +1323,9 @@ def spotify_search(q: str):
         raise HTTPException(502, f"Spotify search failed: {clean_err(e)}")
     with db() as con:
         have = {r["ext_id"] for r in con.execute(
-            "SELECT ext_id FROM tracks WHERE ext_id LIKE 'sp:%'")}
+            "SELECT ext_id FROM tracks WHERE ext_id LIKE 'sp:%' AND id IN "
+            "(SELECT track_id FROM library WHERE profile_id=?)",
+            (profile_id(),))}
     out = []
     for t in (j.get("tracks") or {}).get("items") or []:
         imgs = (t.get("album") or {}).get("images") or []
@@ -1361,7 +1383,9 @@ def search(q: str):
     res = [entry_dict(e) for e in info.get("entries") or [] if e and e.get("id")]
     with db() as con:
         have = {r["video_id"] for r in con.execute(
-            "SELECT video_id FROM tracks WHERE video_id IS NOT NULL")}
+            "SELECT video_id FROM tracks WHERE video_id IS NOT NULL AND id "
+            "IN (SELECT track_id FROM library WHERE profile_id=?)",
+            (profile_id(),))}
     for r in res:
         r["in_library"] = r["video_id"] in have
     return res
@@ -1412,7 +1436,9 @@ def spotify_preview(url: str):
                                  f"{clean_err(e)}")
     with db() as con:
         have = {r["ext_id"] for r in con.execute(
-            "SELECT ext_id FROM tracks WHERE ext_id LIKE 'sp:%'")}
+            "SELECT ext_id FROM tracks WHERE ext_id LIKE 'sp:%' AND id IN "
+            "(SELECT track_id FROM library WHERE profile_id=?)",
+            (profile_id(),))}
     tracks = [{**t, "in_library": f"sp:{t['id']}" in have}
               for t in tracks if t.get("id")]
     return {"kind": kind, "name": name, "tracks": tracks}
@@ -1801,7 +1827,7 @@ def ai_queue(job: dict, songs: bool = False):
     except Exception as e:
         raise HTTPException(503, f"{e}. Start it on the server with: "
                                  "docker compose --profile ai up -d --build")
-    job.update(id=uuid.uuid4().hex[:12], state="queued")
+    job.update(id=uuid.uuid4().hex[:12], state="queued", profile=profile_id())
     ai_jobs.append(job)
     jobs.put(("ai", job))
     return {"ok": True}
@@ -2084,8 +2110,15 @@ def restore_names():
 
 
 @app.get("/api/tracks")
-def tracks(playlist: int | None = None, view: str = ""):
+def tracks(playlist: int | None = None, view: str = "", ids: str = ""):
     cols, src = track_cols(), tracks_from()
+    if ids:  # these songs whoever owns them: another device sent them over
+        want = [int(i) for i in ids.split(",") if i.strip().isdigit()][:300]
+        with db() as con:
+            return [dict(r) for r in con.execute(
+                f"SELECT {cols} FROM tracks t LEFT JOIN profile_tracks pt ON "
+                f"pt.track_id=t.id AND pt.profile_id={profile_id()} WHERE "
+                f"t.id IN ({','.join('?' * len(want)) or 'NULL'})", want)]
     smart = {"liked": "WHERE pt.liked=1 ORDER BY t.id DESC",
              "recent": "WHERE pt.last_played IS NOT NULL "
                        "ORDER BY pt.last_played DESC LIMIT 100",
@@ -2140,6 +2173,25 @@ def played(tid: int):
     return {"ok": True}
 
 
+class ShareReq(BaseModel):
+    profile: int
+
+
+@app.post("/api/tracks/{tid}/share")
+def share_track(tid: int, req: ShareReq):
+    """Put a song into another profile's library too (no second download)."""
+    if req.profile not in _profile_info:
+        raise HTTPException(404, "No such profile")
+    with db() as con:
+        row = con.execute("SELECT title FROM tracks WHERE id=?",
+                          (tid,)).fetchone()
+        if not row:
+            raise HTTPException(404)
+        con.execute("INSERT OR IGNORE INTO library VALUES(?,?)",
+                    (req.profile, tid))
+    return {"ok": True}
+
+
 @app.post("/api/tracks/{tid}/retry")
 def retry(tid: int):
     with db() as con:
@@ -2169,12 +2221,30 @@ def delete_track(tid: int, forever: bool = False):
         row = con.execute("SELECT * FROM tracks WHERE id=?", (tid,)).fetchone()
         if not row:
             raise HTTPException(404)
+        me = profile_id()
+        con.execute("DELETE FROM library WHERE profile_id=? AND track_id=?",
+                    (me, tid))
+        if con.execute("SELECT 1 FROM library WHERE track_id=?",
+                       (tid,)).fetchone():
+            # another profile still has this song: only leave this library
+            con.execute("DELETE FROM playlist_tracks WHERE track_id=? AND "
+                        "playlist_id IN (SELECT id FROM playlists WHERE "
+                        "COALESCE(profile_id,1)=?)", (tid, me))
+            con.execute("DELETE FROM profile_tracks WHERE track_id=? AND "
+                        "profile_id=?", (tid, me))
+            shared = True
+        else:
+            shared = False
+    if shared:
+        log_act("delete", f"Removed “{row['title']}” from the library")
+        return {"ok": True, "trash": None}
+    with db() as con:
         if row["status"] in ("queued", "downloading"):
             cancelled.add(tid)  # stops the download if it is running
         binned = row["status"] == "ready" and not forever
         trash_id = None
         if binned:
-            data = {"row": dict(row),
+            data = {"row": dict(row), "owners": [me],
                     "folders": [[m["playlist_id"], m["position"]] for m in
                                 con.execute("SELECT playlist_id,position FROM "
                                             "playlist_tracks WHERE track_id=?",
@@ -2466,8 +2536,10 @@ def status():
     with db() as con:
         rows = con.execute(
             "SELECT id,title,artist,video_id,status,error FROM tracks WHERE "
-            "status IN ('queued','downloading','error') "
-            "ORDER BY status!='downloading', status='error', id").fetchall()
+            "status IN ('queued','downloading','error') AND id IN "
+            "(SELECT track_id FROM library WHERE profile_id=?) "
+            "ORDER BY status!='downloading', status='error', id",
+            (profile_id(),)).fetchall()
     downloads = [{**dict(r), **progress.get(r["id"], {})} for r in rows]
     n = sum(1 for r in rows if r["status"] != "error")
     return {"pending": n or jobs.unfinished_tasks, "events": list(events),
@@ -2492,8 +2564,10 @@ def media(tid: int, v: int = 0):
 def where(video_id: str):
     """Where a YouTube song lives in the library: its id and a folder, if any."""
     with db() as con:
-        row = con.execute("SELECT id FROM tracks WHERE video_id=? ORDER BY id "
-                          "LIMIT 1", (video_id,)).fetchone()
+        row = con.execute(
+            "SELECT id FROM tracks WHERE video_id=? AND id IN (SELECT track_id "
+            "FROM library WHERE profile_id=?) ORDER BY id LIMIT 1",
+            (video_id, profile_id())).fetchone()
         if not row:
             raise HTTPException(404, "Not in the library")
         pl = con.execute(
@@ -2636,6 +2710,10 @@ def delete_profile(pid: int):
         con.execute("DELETE FROM playlists WHERE profile_id=?", (pid,))
         con.execute("DELETE FROM profile_tracks WHERE profile_id=?", (pid,))
         con.execute("DELETE FROM profile_keys WHERE profile_id=?", (pid,))
+        con.execute("INSERT OR IGNORE INTO library SELECT 1,track_id FROM "
+                    "library WHERE profile_id=? AND track_id NOT IN (SELECT "
+                    "track_id FROM library WHERE profile_id!=?)", (pid, pid))
+        con.execute("DELETE FROM library WHERE profile_id=?", (pid,))
         con.execute("DELETE FROM profiles WHERE id=?", (pid,))
     load_profiles()
     log_act("profile", f"Deleted the profile “{name}”")
@@ -2753,7 +2831,9 @@ def trash_list():
     purge_trash(older_than=time.time() - TRASH_DAYS * 86400)
     out = []
     with db() as con:
-        for r in con.execute("SELECT * FROM trash ORDER BY at DESC"):
+        mine = profile_id()
+        for r in con.execute("SELECT * FROM trash WHERE ?=1 OR profile_id=? "
+                             "ORDER BY at DESC", (mine, mine)):
             data = json.loads(r["data"])
             row = data["row"]
             item = {"id": r["id"], "kind": r["kind"], "name": r["name"],
@@ -2798,6 +2878,13 @@ def trash_restore(xid: int):
                                (pid,)).fetchone():
                     con.execute("INSERT OR IGNORE INTO playlist_tracks "
                                 "VALUES(?,?,?)", (pid, tid, pos))
+            for owner in data.get("owners") or []:
+                if owner in _profile_info:
+                    con.execute("INSERT OR IGNORE INTO library VALUES(?,?)",
+                                (owner, tid))
+            if data.get("owners") and profile_id() not in data["owners"]:
+                con.execute("DELETE FROM library WHERE profile_id=? AND "
+                            "track_id=?", (profile_id(), tid))
             for p in data.get("profiles") or []:
                 if p[0] in _profile_info:
                     con.execute("INSERT OR REPLACE INTO profile_tracks "
@@ -2849,7 +2936,8 @@ def activity():
         return [dict(r) for r in con.execute(
             "SELECT a.id,a.at,a.action,a.text,a.profile_id,p.name AS profile "
             "FROM activity a LEFT JOIN profiles p ON p.id=a.profile_id "
-            "ORDER BY a.id DESC LIMIT 300")]
+            "WHERE ?=1 OR a.profile_id=? ORDER BY a.id DESC LIMIT 300",
+            (profile_id(), profile_id()))]
 
 
 # -------------------------------------------------- lyrics from the sound (AI)
@@ -2970,10 +3058,12 @@ def cleanup():
             "(SELECT COALESCE(MAX(liked),0) FROM profile_tracks WHERE "
             "track_id=t.id) AS liked,"
             "(SELECT COUNT(*) FROM playlist_tracks WHERE track_id=t.id) "
-            "AS folders FROM tracks t")]
+            "AS folders FROM tracks t WHERE t.id IN (SELECT track_id FROM "
+            "library WHERE profile_id=?)", (profile_id(),))]
         folders = [dict(r) for r in con.execute(
             "SELECT p.id,p.name,COUNT(pt.track_id) AS count FROM playlists p "
-            "LEFT JOIN playlist_tracks pt ON pt.playlist_id=p.id GROUP BY p.id")]
+            "LEFT JOIN playlist_tracks pt ON pt.playlist_id=p.id WHERE "
+            "COALESCE(p.profile_id,1)=? GROUP BY p.id", (profile_id(),))]
         members = con.execute("SELECT playlist_id,track_id FROM "
                               "playlist_tracks").fetchall()
     size = {}

@@ -388,6 +388,7 @@ function trackMenu(t, anchor) {
     items.push({ icon: 'queue', label: 'Play next', fn: () => playNext(t) });
     items.push({ icon: 'plus', label: 'Add to queue', fn: () => addToQueue(t) });
     items.push(...deviceItems(t));
+    if (profile.list.length > 1 && !document.body.classList.contains('kid')) items.push({ icon: 'person', label: 'Copy to another profile…', fn: a => shareTo([t], a) });
     items.push({ icon: t.liked ? 'heart' : 'heartLine', label: t.liked ? 'Remove from Liked' : 'Like', fn: () => toggleLike(t) });
     items.push({ icon: 'lyrics', label: 'Show lyrics', fn: () => { if (!current() || current().id !== t.id) playFrom(t.id); openNp(); } });
     items.push({ icon: 'lyrics', label: 'Write lyrics from the sound (AI)', fn: a => aiLyrics(t, a) });
@@ -546,6 +547,7 @@ function bulkMenu(list, anchor) {
     }
     reload(true);
   } });
+  if (lib.length && profile.list.length > 1 && !document.body.classList.contains('kid')) items.push({ icon: 'person', label: 'Copy to another profile…', fn: a => shareTo(lib, a) });
   if (lib.length) items.push({ icon: 'trash', label: `Delete ${lib.length} from library`, danger: true, fn: () => deleteTracks(lib) });
   openMenu(anchor, items, `${list.length} tracks selected`);
 }
@@ -2816,7 +2818,7 @@ async function runCmd(cmd, v) {
   else if (cmd === 'volume' && isFinite(v)) { setVolume(Math.max(0, Math.min(2, +v))); save('prefs', prefs); }
   else if (cmd === 'playTracks' && v && Array.isArray(v.ids)) {
     let all = [];
-    try { all = await api('/api/tracks'); } catch { return; }
+    try { all = await api('/api/tracks?ids=' + v.ids.slice(0, 300).join(',')); } catch { return; }
     const byId = new Map(all.map(t => [t.id, t])), q = v.ids.map(i => byId.get(i)).filter(t => t && t.status === 'ready');
     if (!q.length) return;
     state.queue = q; playIndex(Math.max(0, q.findIndex(t => t.id === v.start)));
@@ -3294,6 +3296,16 @@ function homeDialog(redraw) {
   wrap.onkeydown = e => { e.stopPropagation(); if (e.key === 'Escape') done(); };
   form.onsubmit = e => { e.preventDefault(); done(); };
   ok.focus();
+}
+
+// Every profile has its own library. This puts songs into another profile's
+// library as well, without downloading them a second time.
+function shareTo(list, anchor) {
+  openMenu(anchor, profile.list.filter(p => p.id !== profile.id).map(p => ({ icon: 'person', label: p.name, fn: async () => {
+    let n = 0;
+    for (const t of list) { try { await post(`/api/tracks/${t.id}/share`, { profile: p.id }); n++; } catch (e) { toast(e.message, 'error'); break; } }
+    if (n) toast(`${n} song${n === 1 ? '' : 's'} copied to ${p.name}'s library`);
+  } })), 'Copy to which profile?');
 }
 
 // ------------------------------------------------------------------ init

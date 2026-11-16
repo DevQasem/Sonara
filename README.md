@@ -26,9 +26,10 @@ Self-hosted web music player for your LAN. Works on desktop and phones.
 - **Crossfade and even loudness**: songs blend into each other (0 to 12
   seconds, Settings → Playback) and every song is measured once so quiet and
   loud songs play at the same level.
-- **Profiles**: one library for the whole house; each profile (the round
-  button at the top) has its own likes, history, most played and folders.
-  Profiles have no passwords of their own.
+- **Profiles**: each profile (the round button at the top) has its own
+  library of songs, likes, history, most played and folders. A song that two
+  profiles have is stored once. "Copy to another profile" in a song's menu
+  puts it in someone else's library without a second download.
 - **Devices (remote control)**: every device that has the player open shows
   up under the devices button. Control what another one is playing (play,
   pause, skip, seek, volume) or send it songs with right-click → Play on…
