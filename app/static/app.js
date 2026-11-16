@@ -74,6 +74,9 @@ if (!Array.isArray(prefs.eq) || prefs.eq.length !== EQ_F.length) { prefs.eq = EQ
 function load(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } }
 function save(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
 let vizColors = ['#8b5cf6', '#ec4899'];
+const IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+// On an iPhone the sound-only mode is the default (exact jumps); Video is one tap away.
+if (IOS && !prefs.iosAudio) { prefs.avMode = 'audio'; prefs.iosAudio = 1; }
 function applyPrefs() {
   root.dataset.theme = prefs.theme;
   document.body.classList.toggle('anim', prefs.anim);
@@ -154,13 +157,18 @@ function applyRemix() {
 }
 // Quick effect buttons in the player: one click and the playing song
 // changes straight away. They stay on from song to song until switched off.
+// Slowed and Sped up come in five strengths (3 is the classic amount).
+const SLOW = [0.95, 0.9, 0.85, 0.8, 0.7], FAST = [1.05, 1.1, 1.2, 1.3, 1.5];
 const FX = [
-  ['Slowed', () => remix.speed < 1, () => { remix.speed = remix.speed < 1 ? 1 : 0.85; }],
-  ['Sped up', () => remix.speed > 1, () => { remix.speed = remix.speed > 1 ? 1 : 1.2; }],
+  ['Slowed', () => remix.speed < 1, () => { remix.speed = remix.speed < 1 ? 1 : SLOW[(prefs.slowLv || 3) - 1]; }],
+  ['Sped up', () => remix.speed > 1, () => { remix.speed = remix.speed > 1 ? 1 : FAST[(prefs.fastLv || 3) - 1]; }],
   ['Reverb', () => remix.reverb > 0, () => { remix.reverb = remix.reverb ? 0 : 0.5; }],
   ['Bass', () => remix.bass > 0, () => { remix.bass = remix.bass ? 0 : 8; }],
   ['8D', () => remix.pan, () => { remix.pan = !remix.pan; }],
 ];
+// "No vocals" plays the song's music without the singing, "Vocals only" the
+// singing without the music: the same song, at the same spot.
+const STEMS = [['No vocals', 'music', 'Take the singing out of this song'], ['Vocals only', 'vocals', 'Take the music out and keep only the singing']];
 function fxChips(box) {
   box.classList.add('fx-chips');
   const changed = () => { remixNamed = false; applyRemix(); if (state.view.type === 'remix' && paintRemix) paintRemix(); };
@@ -169,13 +177,70 @@ function fxChips(box) {
     b.onclick = e => { e.stopPropagation(); flip(); changed(); };
     box.append(b);
   }
+  for (const [label, kind, tip] of STEMS) {
+    const b = el('button', 'chip stem', label); b.type = 'button'; b.title = tip;
+    b._on = () => current()?.stem === kind; b._wait = () => current()?.stemWant === kind;
+    b.onclick = e => { e.stopPropagation(); setStem(kind); };
+    box.append(b);
+  }
   const off = el('button', 'chip fx-off', 'Off'); off.type = 'button'; off.title = 'Back to the original sound';
-  off.onclick = e => { e.stopPropagation(); resetRemix(); };
+  off.onclick = e => { e.stopPropagation(); const t = current(); if (t && (t.stem || t.stemWant)) { t.stemWant = null; if (t.stem) swapStem(t, null); } resetRemix(); };
   box.append(off);
+  // strength of Slowed / Sped up, shown while one of them is on
+  const lv = el('div', 'fx-level'); lv.append(el('span'));
+  for (let n = 1; n <= 5; n++) {
+    const b = el('button', 'lv', n); b.type = 'button';
+    b.onclick = e => {
+      e.stopPropagation();
+      if (remix.speed < 1) { prefs.slowLv = n; remix.speed = SLOW[n - 1]; } else if (remix.speed > 1) { prefs.fastLv = n; remix.speed = FAST[n - 1]; }
+      save('prefs', prefs); changed();
+    };
+    lv.append(b);
+  }
+  box.append(lv);
 }
+const fxOn = () => remixOn() || !!(current() && (current().stem || current().stemWant));
 function paintFx() {
-  document.querySelectorAll('.fx-chips .chip').forEach(b => { if (b._on) b.classList.toggle('sel', b._on()); else b.hidden = !remixOn(); });
-  document.getElementById('fxBtn')?.classList.toggle('on', remixOn());
+  document.querySelectorAll('.fx-chips .chip').forEach(b => {
+    if (b._on) { b.classList.toggle('sel', b._on()); b.classList.toggle('wait', !!(b._wait && b._wait())); }
+    else b.hidden = !fxOn();
+  });
+  document.querySelectorAll('.fx-level').forEach(l => {
+    const on = remix.speed !== 1, list = remix.speed < 1 ? SLOW : FAST;
+    l.hidden = !on;
+    if (!on) return;
+    let k = 0; list.forEach((v, i) => { if (Math.abs(v - remix.speed) < Math.abs(list[k] - remix.speed)) k = i; });
+    l.firstChild.textContent = (remix.speed < 1 ? 'Slowed' : 'Sped up') + ' strength';
+    [...l.querySelectorAll('.lv')].forEach((b, i) => b.classList.toggle('sel', i === k));
+  });
+  document.getElementById('fxBtn')?.classList.toggle('on', fxOn());
+}
+// Switch the playing song to one of its halves (or back) without losing the place.
+function swapStem(t, kind) {
+  const here = current() === t, time = audio.currentTime, playing = !audio.paused;
+  t.stem = kind; t.stemWant = null;
+  if (!here) return;
+  audio.src = srcOf(t); applyRemix(); applyNorm();
+  audio.addEventListener('loadedmetadata', () => { audio.currentTime = time; }, { once: true });
+  if (playing) audio.play().catch(() => {});
+  paintMode(t); paintFx();
+}
+async function setStem(kind) {
+  const t = current();
+  if (!t) return toast('Play a song first');
+  if (!t.id) return toast('Download this song first: only songs in your library can be split');
+  if (t.stem === kind || t.stemWant === kind) { t.stemWant = null; if (t.stem) swapStem(t, null); else paintFx(); return; }
+  let r;
+  try { r = await post(`/api/tracks/${t.id}/stems`); } catch (e) { return toast(e.message, 'error', 9000); }
+  if (r.ready) return swapStem(t, kind);
+  t.stemWant = kind; state.stemPoll = true; paintFx();
+  toast(`Separating the vocals and the music of “${t.title}”. It switches by itself in about a minute; after that it is instant for this song.`, 'info', 9000);
+}
+// Called while a split is being made: switch as soon as it is ready.
+async function stemCheck() {
+  const t = current();
+  if (!t || !t.stemWant) { state.stemPoll = !!state.queue.find(x => x.stemWant); return; }
+  try { if ((await api(`/api/tracks/${t.id}/stems`)).ready) swapStem(t, t.stemWant); } catch {}
 }
 // Volume goes past 100%: up to there it is the normal volume, above it the
 // sound is made louder than the original (it can distort on loud songs).
@@ -203,11 +268,14 @@ const tkey = t => t.id ?? t.key ?? 'yt:' + t.video_id;
 // A song can have both sound and picture: library tracks with a video file,
 // uploaded videos, and anything streamed from YouTube.
 const canVideo = t => !t.id || t.kind === 'video';
-const modeOf = t => !canVideo(t) ? 'audio' : t.id ? prefs.avMode : (t.kind === 'video' ? 'video' : 'audio');
+const modeOf = t => !canVideo(t) || t.stem ? 'audio' : t.id ? prefs.avMode : (t.kind === 'video' ? 'video' : 'audio');
 // The video file carries the sound too, so one source serves both modes and
 // switching between them never reloads (a stream moves to its video source
 // the first time video is asked for, then stays on it).
-const srcOf = t => t.id ? `/media/${t.id}${t.vfile ? '?v=1' : ''}`
+// iPhones and iPads jump inexactly in the video files (they land on the
+// picture's last keyframe, seconds early), so in audio mode they play an AAC
+// copy of the sound instead, in which every jump is exact.
+const srcOf = t => t.id && t.stem ? `/media/${t.id}?stem=${t.stem}` : t.id ? (IOS && modeOf(t) !== 'video' ? `/media/${t.id}?fmt=aac` : `/media/${t.id}${t.vfile ? '?v=1' : ''}`)
   : `/api/stream/${t.video_id}${t.vsrc ? '?kind=video' : ''}`;
 const showingVideo = () => document.body.classList.contains('is-video');
 // A fake anchor so menus can open at the mouse position (right-click).
@@ -1328,7 +1396,7 @@ async function renderHome() {
 }
 
 // The AI jobs that are waiting or running, shown at the top of the studio.
-const JOB_WORD = { lyrics: 'Writing the lyrics of', extend: 'Extending', song: 'Creating', cover: 'Covering', repaint: 'Re-making part of', split: 'Splitting', mashup: 'Mixing', generate: 'Creating' };
+const JOB_WORD = { stems: 'Separating vocals and music of', lyrics: 'Writing the lyrics of', extend: 'Extending', song: 'Creating', cover: 'Covering', repaint: 'Re-making part of', split: 'Splitting', mashup: 'Mixing', generate: 'Creating' };
 function paintAi() {
   const box = $('stJobs');
   if (!box) return;
@@ -1897,7 +1965,7 @@ function paintMode(t) {
   const mode = modeOf(t), video = mode === 'video';
   document.body.classList.toggle('is-video', video);
   $('fsBtn').hidden = !video;
-  $('avTabs').hidden = !canVideo(t);
+  $('avTabs').hidden = !canVideo(t) || !!t.stem;  // a vocals-only or music-only half has no picture
   $('avTabs').querySelectorAll('button').forEach(b => b.classList.toggle('sel', b.dataset.m === mode));
   if (!video) vizStart();
 }
@@ -2078,6 +2146,16 @@ function flushReverb() {
   fx.verb = fresh;
 }
 audio.addEventListener('seeking', () => { flushReverb(); if (xfading) stopTail(); });
+// iPhone, video mode: if a jump lands before the spot that was asked for, stay
+// silent until the song reaches it, instead of playing the part before.
+if (IOS) {
+  let want = null, since = 0;
+  const release = () => { if (want !== null) { want = null; audio.muted = false; } };
+  audio.addEventListener('seeking', () => { want = audio.currentTime; since = performance.now(); });
+  audio.addEventListener('seeked', () => { if (want !== null && audio.currentTime < want - 0.3) audio.muted = true; else release(); });
+  audio.addEventListener('timeupdate', () => { if (want !== null && (audio.currentTime >= want - 0.05 || performance.now() - since > 9000)) release(); });
+  audio.addEventListener('emptied', release);
+}
 audio.addEventListener('emptied', flushReverb);
 function applyEq() { if (eqNodes) eqNodes.forEach((n, i) => { n.gain.value = prefs.eqOn ? prefs.eq[i] : 0; }); }
 
@@ -2617,6 +2695,7 @@ async function poll() {
     paintDownloads();
     const before = (state.ai || []).length;
     state.ai = s.ai || []; paintAi();
+    if (state.stemPoll) stemCheck();
     if (state.ai.length < before) { lyricsCache.clear(); state.lyricsFor = null; if (npOpen()) showLyrics(); if (state.studioRefresh) state.studioRefresh(); }  // a studio job finished
     if (s.pending || state.wasPending) await reload();
     state.wasPending = s.pending > 0;

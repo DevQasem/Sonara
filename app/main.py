@@ -320,7 +320,7 @@ def load_profiles():
 
 # What a listen-only (kids) profile may still change: its own likes, play
 # counts and folders.
-KID_OK = re.compile(r"^/api/(tracks/\d+/(like|played)|playlists(/.*)?|"
+KID_OK = re.compile(r"^/api/(tracks/\d+/(like|played|stems)|playlists(/.*)?|"
                     r"login|logout|profiles/\d+/unlock)$")
 
 
@@ -1771,6 +1771,10 @@ def _run_ai(job: dict):
             run_lyrics(job)
             job["state"] = "done"
             return
+        if job["kind"] == "stems":
+            run_stems(job, tmp)
+            job["state"] = "done"
+            return
         if job["kind"] == "split":
             with db() as con:
                 row = con.execute("SELECT * FROM tracks WHERE id=?",
@@ -2546,9 +2550,99 @@ def status():
             "downloads": downloads, "ai": ai_active()}
 
 
+# iPhones and iPads jump inexactly in the library's own files (Opus sound,
+# and in videos a keyframe only every few seconds), so they get a plain AAC
+# copy of the sound, made the first time a song is played there and kept.
+AAC_CACHE = DATA / "cache" / "aac"
+_aac_locks: dict = {}
+_aac_guard = threading.Lock()
+
+
+def aac_copy(src: Path) -> Path:
+    if src.suffix.lower() == ".m4a" and audio_codec(src) == "aac":
+        return src
+    out = AAC_CACHE / (src.stem + ".m4a")
+    with _aac_guard:
+        lock = _aac_locks.setdefault(out.name, threading.Lock())
+    with lock:  # two requests for the same song make it once
+        if not out.exists() or out.stat().st_mtime < src.stat().st_mtime:
+            AAC_CACHE.mkdir(parents=True, exist_ok=True)
+            tmp = out.with_suffix(".part.m4a")
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-v", "error", "-i", str(src), "-vn", "-c:a",
+                 "aac", "-b:a", "192k", "-movflags", "+faststart", str(tmp)],
+                capture_output=True, text=True, timeout=600)
+            if r.returncode or not tmp.exists():
+                tmp.unlink(missing_ok=True)
+                raise HTTPException(500, "Could not prepare this song")
+            tmp.replace(out)
+    return out
+
+
+# "No vocals" and "Vocals only" in the player: the AI add-on splits a song
+# once, the two halves are kept next to the library, and the player switches
+# to one of them while the song plays. No new song is made.
+STEMS = DATA / "cache" / "stems"
+
+
+def stem_paths(file_name: str) -> dict:
+    base = Path(file_name).stem
+    return {k: STEMS / f"{base}.{k}.m4a" for k in ("vocals", "music")}
+
+
+def stems_ready(file_name) -> bool:
+    return bool(file_name) and all(p.exists()
+                                   for p in stem_paths(file_name).values())
+
+
+@app.get("/api/tracks/{tid}/stems")
+def stems_state(tid: int):
+    with db() as con:
+        row = con.execute("SELECT file FROM tracks WHERE id=?", (tid,)).fetchone()
+    if not row:
+        raise HTTPException(404)
+    return {"ready": stems_ready(row["file"])}
+
+
+@app.post("/api/tracks/{tid}/stems")
+def stems_make(tid: int):
+    """Ready at once if this song was split before; otherwise the split is
+    started (about a minute) and the player asks again."""
+    with db() as con:
+        row = con.execute("SELECT title,file FROM tracks WHERE id=? AND "
+                          "status='ready'", (tid,)).fetchone()
+    if not row or not row["file"]:
+        raise HTTPException(404, "That song is not in the library")
+    if stems_ready(row["file"]):
+        return {"ready": True}
+    if not any(j["kind"] == "stems" and j["track_id"] == tid and j["state"] in
+               ("queued", "working") for j in ai_jobs):
+        ai_queue({"kind": "stems", "track_id": tid, "label": row["title"]})
+    return {"ready": False}
+
+
+def run_stems(job: dict, tmp: Path):
+    with db() as con:
+        row = con.execute("SELECT * FROM tracks WHERE id=?",
+                          (job["track_id"],)).fetchone()
+    if not row or not row["file"]:
+        raise RuntimeError("That song is no longer in the library")
+    res = ai_call("/separate", {"src": str(MUSIC / Path(row["file"]).name),
+                                "out_dir": str(tmp)}, 3600)
+    STEMS.mkdir(parents=True, exist_ok=True)
+    out = stem_paths(row["file"])
+    for key, wav in (("vocals", res["vocals"]), ("music", res["instrumental"])):
+        part = out[key].with_suffix(".part.m4a")
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", wav, "-c:a", "aac",
+                        "-b:a", "192k", "-movflags", "+faststart", str(part)],
+                       check=True, timeout=600)
+        part.replace(out[key])
+
+
 @app.get("/media/{tid}")
-def media(tid: int, v: int = 0):
-    """The song's audio file, or with ?v=1 its video file."""
+def media(tid: int, v: int = 0, fmt: str = "", stem: str = ""):
+    """The song's audio file, with ?v=1 its video file, or with ?fmt=aac a
+    copy of the sound that iPhones can jump around in exactly."""
     with db() as con:
         row = con.execute("SELECT file,video_file FROM tracks WHERE id=?",
                           (tid,)).fetchone()
@@ -2556,6 +2650,14 @@ def media(tid: int, v: int = 0):
     path = MUSIC / Path(name).name if name else None
     if not path or not path.exists():
         raise HTTPException(404)
+    if stem in ("vocals", "music"):
+        part = stem_paths(row["file"] or "")[stem] if row["file"] else None
+        if not part or not part.exists():
+            raise HTTPException(404, "This song has not been split yet")
+        return FileResponse(part, media_type="audio/mp4")
+    if fmt == "aac":
+        path = aac_copy(path)
+        return FileResponse(path, media_type="audio/mp4")
     return FileResponse(
         path, media_type=mimetypes.guess_type(path.name)[0] or "audio/mpeg")
 
@@ -2803,6 +2905,9 @@ def drop_song_files(names, con):
                            (n, n)).fetchone()
         if not used and n not in held:
             (MUSIC / n).unlink(missing_ok=True)
+            (AAC_CACHE / (Path(n).stem + ".m4a")).unlink(missing_ok=True)
+            for part in stem_paths(n).values():
+                part.unlink(missing_ok=True)
 
 
 def purge_trash(ids=None, older_than: float | None = None):
