@@ -350,3 +350,89 @@ def group_words(words: list) -> list:
         out.append((cur[0][0], cur[-1][1], " ".join(x[2] for x in cur)))
     return out
 
+
+
+# ------------------------------------------- tags: genre, mood, tempo and key
+# A sound-and-text model is asked which description fits the song best.
+CLAP = os.environ.get("CLAP_MODEL", "laion/clap-htsat-unfused")
+GENRES = ["pop", "rock", "hip hop", "trap", "phonk", "electronic dance",
+          "house", "arabic pop", "arabic traditional", "dabke", "turkish pop",
+          "r&b", "jazz", "classical", "metal", "lo-fi", "folk", "reggaeton",
+          "k-pop", "soundtrack", "ambient"]
+MOODS = ["happy", "sad", "energetic", "calm", "romantic", "dark", "angry",
+         "dreamy"]
+
+
+class DescribeReq(BaseModel):
+    src: str
+
+
+@app.post("/describe")
+def describe(req: DescribeReq):
+    src = inside_data(req.src)
+    with _lock:
+        out = analyse(src)
+        out = {"bpm": round(out["bpm"], 1), "first": round(out["first"], 3),
+               "key": out["key"], "genre": [], "mood": ""}
+        try:
+            from transformers import pipeline
+            pipe = use("clap", lambda: pipeline(
+                "zero-shot-audio-classification", model=CLAP,
+                device=0 if DEV == "cuda" else -1))
+            y = read_audio(src, 48000, 1)[0]
+            mid = len(y) // 2            # 30 seconds from the middle of the song
+            clip = y[max(0, mid - 15 * 48000):mid + 15 * 48000]
+            g = pipe(clip, candidate_labels=GENRES,
+                     hypothesis_template="This is {} music.")
+            m = pipe(clip, candidate_labels=MOODS,
+                     hypothesis_template="This music sounds {}.")
+            out["genre"] = [g[0]["label"]] + (
+                [g[1]["label"]] if g[1]["score"] > g[0]["score"] * 0.6 else [])
+            out["mood"] = m[0]["label"]
+        except Exception as e:   # tempo and key are still worth having
+            out["error"] = str(e)[:200]
+        return out
+
+
+# ------------------------------------------------------------- translation
+NLLB = os.environ.get("NLLB_MODEL", "facebook/nllb-200-distilled-600M")
+NLLB_CODE = {"en": "eng_Latn", "ar": "arb_Arab", "tr": "tur_Latn",
+             "es": "spa_Latn", "fr": "fra_Latn", "de": "deu_Latn",
+             "ru": "rus_Cyrl", "hi": "hin_Deva", "ko": "kor_Hang",
+             "ja": "jpn_Jpan", "pt": "por_Latn", "it": "ita_Latn",
+             "fa": "pes_Arab", "ur": "urd_Arab", "id": "ind_Latn"}
+
+
+def load_nllb():
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(NLLB)
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        NLLB, torch_dtype=torch.float16 if DEV == "cuda" else torch.float32)
+    return tok, model.to(DEV).eval()
+
+
+class TranslateReq(BaseModel):
+    lines: list[str]
+    source: str = "en"
+    target: str = "en"
+
+
+@app.post("/translate")
+def translate(req: TranslateReq):
+    if req.source not in NLLB_CODE or req.target not in NLLB_CODE:
+        raise HTTPException(400, "Unknown language")
+    with _lock:
+        tok, model = use("nllb", load_nllb)
+        tok.src_lang = NLLB_CODE[req.source]
+        goal = tok.convert_tokens_to_ids(NLLB_CODE[req.target])
+        out = []
+        for i in range(0, len(req.lines), 16):
+            batch = req.lines[i:i + 16]
+            enc = tok(batch, return_tensors="pt", padding=True, truncation=True,
+                      max_length=128).to(DEV)
+            with torch.no_grad():
+                gen = model.generate(**enc, forced_bos_token_id=goal,
+                                     max_new_tokens=160, num_beams=3)
+            out += [s.strip() for s in tok.batch_decode(
+                gen, skip_special_tokens=True)]
+        return {"lines": out}

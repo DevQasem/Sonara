@@ -762,3 +762,21 @@ body.kid #uploadBtn,body.kid #saveBtn,body.kid #npSave,body.kid #drop{display:no
 @keyframes stemWait{50%{opacity:.45}}
 .fx-chips .chip.wait{border-color:var(--accent);animation:stemWait 1.1s ease-in-out infinite}
 .fx-pop{width:300px}
+
+/* ---- tags line, translation, karaoke, hidden pictures ---- */
+.np-tags{display:block;color:var(--mute);font-size:12px;margin:-4px 0 6px;min-height:1em;overflow-wrap:anywhere}
+.lyrics p .tr{display:block;font-size:.62em;font-weight:500;opacity:.7;margin-top:2px}
+.lyrics p.on .tr{opacity:.9}
+.icon-btn.on#npHide,.icon-btn.on#npKara{color:var(--accent)}
+#tagSel[hidden]{display:none}
+body.karaoke .np .art-wrap,body.karaoke .np .av-tabs,body.karaoke #npFx,body.karaoke #npSave,body.karaoke .np-tags,body.karaoke .ly-head,body.karaoke .np-act>:not(#npKara){display:none!important}
+body.karaoke .np.open .np-body{display:flex;flex-direction:column;gap:10px;max-width:1400px}
+body.karaoke .np-right{order:1;flex:1;min-height:0;background:none!important;border:0!important}
+body.karaoke .np-left{order:2;flex:none;flex-direction:row;flex-wrap:wrap;align-items:center;justify-content:center;gap:6px 18px;text-align:left}
+body.karaoke .np-left h2{margin:0;font-size:18px}
+body.karaoke .np-left p{margin:0}
+body.karaoke .np-left .seek{flex-basis:100%;display:flex!important;max-width:760px}
+body.karaoke .np-left>.b{display:flex!important}
+body.karaoke .lyrics{text-align:center}
+body.karaoke .lyrics p{font-size:clamp(24px,4vw,52px);line-height:1.25;padding:.25em 0;opacity:.35}
+body.karaoke .lyrics p.on{opacity:1;transform:scale(1.04)}

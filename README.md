@@ -2,6 +2,14 @@
 
 Self-hosted web music player for your LAN. Works on desktop and phones.
 
+| Home | Library |
+| --- | --- |
+| ![Home page with shelves](docs/home.jpg) | ![Library list with the now-playing panel](docs/library.jpg) |
+
+| Now playing with lyrics | Remix studio |
+| --- | --- |
+| ![Full-screen now playing with lyrics](docs/now-playing.jpg) | ![Remix studio](docs/studio.jpg) |
+
 ## Features
 
 - **One library for everything**: YouTube, Spotify and your own files sit
@@ -53,6 +61,19 @@ Self-hosted web music player for your LAN. Works on desktop and phones.
 - **AI lyrics and longer songs** (AI add-on): when no lyrics are found, the
   AI listens to the singing and writes synced lyrics; Remix → AI tools can
   make a song longer at the end or add an intro.
+- **Karaoke and live vocals**: "No vocals" and "Vocals only" switch the
+  playing song on the spot (the AI splits a song once, then it is instant),
+  and Karaoke mode adds big lyrics that fill the screen.
+- **Auto DJ**: songs with a similar tempo are matched to the beat and mixed
+  into each other (Settings → Playback; needs the AI tags).
+- **AI tags**: genre, mood, tempo and language for every song, with a tag
+  filter above each list (Settings → Library → Tag my songs). The tags are
+  the AI's guess and are sometimes wrong.
+- **Albums and pictures**: an Albums page (looked up through the iTunes
+  Search service), your own picture for any song or folder, and a button to
+  hide a song's picture and video everywhere.
+- **Lyrics translation**: a second line in your language under each lyric
+  line, translated on your own server by the AI add-on.
 - **Phone**: bottom tabs, a floating mini player, swipe it up for the full
   player, sideways to change song, and swipe the full player down to close.
 

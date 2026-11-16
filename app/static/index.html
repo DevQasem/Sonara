@@ -20,6 +20,7 @@
     <button class="nav" data-view="home"><i data-ico="home"></i><span>Home</span></button>
     <button class="nav" data-view="search"><i data-ico="search"></i><span>Search</span></button>
     <button class="nav" data-view="library"><i data-ico="music"></i><span>Library</span></button>
+    <button class="nav" data-view="albums"><i data-ico="album"></i><span>Albums</span></button>
     <button class="nav" data-view="liked"><i data-ico="heart"></i><span>Liked</span></button>
     <button class="nav" data-view="recent"><i data-ico="history"></i><span>Recently played</span></button>
     <button class="nav" data-view="top"><i data-ico="trending"></i><span>Most played</span></button>
@@ -106,10 +107,13 @@
       </div>
       <h2 id="npT">Nothing playing</h2>
       <p id="npA"></p>
+      <small id="npTags" class="np-tags"></small>
       <div class="np-act">
         <button class="icon-btn heart" id="npLike" title="Like" hidden><i data-ico="heartLine"></i></button>
         <button class="icon-btn" id="npQueue" title="Queue"><i data-ico="queue"></i></button>
         <button class="icon-btn" id="npDev" title="Devices"><i data-ico="devices"></i></button>
+        <button class="icon-btn" id="npKara" title="Karaoke: no vocals and big lyrics"><i data-ico="mic"></i></button>
+        <button class="icon-btn" id="npHide" title="Hide this picture" hidden><i data-ico="eyeOff"></i></button>
         <button class="icon-btn" id="fsBtn" title="Full screen" hidden><i data-ico="fullscreen"></i></button>
       </div>
       <div id="npFx"></div>
@@ -133,6 +137,7 @@
         <button class="chip" id="lyUpload" title="Use a .lrc or .txt file from this device">Upload</button>
         <button class="chip" id="lySave">Save</button>
         <button class="chip" id="lyCard" title="Make a picture or short video of these lyrics to share">Card</button>
+        <button class="chip" id="lyTr" title="Show a translation under each line">Translate</button>
         <input type="file" id="lyFile" accept=".lrc,.txt,text/plain" hidden>
       </div>
       <div class="lyrics" id="lyrics"></div>
@@ -169,6 +174,12 @@
 </div>
 
 <div id="toasts"></div>
-<script src="app.js"></script>
+<script src="js/01-core.js"></script>
+<script src="js/02-library.js"></script>
+<script src="js/03-home-studio.js"></script>
+<script src="js/04-player.js"></script>
+<script src="js/05-library-tools.js"></script>
+<script src="js/06-extras.js"></script>
+<script src="js/07-start.js"></script>
 </body>
 </html>

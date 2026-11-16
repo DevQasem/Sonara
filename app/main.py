@@ -56,7 +56,7 @@ SPOTIFY_RE = re.compile(
 YOUTUBE_HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 TRACK_COLS = ("id,title,artist,duration,source,video_id,status,error,"
-              "lyrics_state,kind,gain")
+              "lyrics_state,kind,gain,nocover,ccover,album,year,bpm,beat0,tags")
 
 app = FastAPI(title="Sonara")
 jobs: "queue.Queue[tuple[str, object]]" = queue.Queue()
@@ -127,6 +127,10 @@ def init_db():
                                 con.execute("PRAGMA table_info(playlists)")}:
             con.execute("ALTER TABLE playlists ADD COLUMN profile_id INTEGER "
                         "DEFAULT 1")
+        if "cover" not in {r["name"] for r in
+                           con.execute("PRAGMA table_info(playlists)")}:
+            con.execute("ALTER TABLE playlists ADD COLUMN cover INTEGER "
+                        "DEFAULT 0")
         pcols = {r["name"] for r in con.execute("PRAGMA table_info(profiles)")}
         if "pin" not in pcols:
             con.execute("ALTER TABLE profiles ADD COLUMN pin TEXT")
@@ -141,7 +145,10 @@ def init_db():
                           ("last_played", "REAL"), ("video_file", "TEXT"),
                           ("raw_title", "TEXT"), ("raw_artist", "TEXT"),
                           ("lyrics_offset", "REAL DEFAULT 0"),
-                          ("gain", "REAL")):
+                          ("gain", "REAL"), ("nocover", "INTEGER DEFAULT 0"),
+                          ("ccover", "INTEGER DEFAULT 0"), ("album", "TEXT"),
+                          ("year", "TEXT"), ("bpm", "REAL"), ("beat0", "REAL"),
+                          ("tags", "TEXT"), ("lyrics_tr", "TEXT")):
             if name not in cols:
                 con.execute(f"ALTER TABLE tracks ADD COLUMN {name} {ddl}")
         # Each profile has its own library. Songs from before that split all
@@ -1063,6 +1070,7 @@ def startup():
         threading.Thread(target=worker, daemon=True).start()
     threading.Thread(target=watch_import, daemon=True).start()
     threading.Thread(target=loudness_worker, daemon=True).start()
+    threading.Thread(target=album_worker, daemon=True).start()
 
 
 # ------------------------------------------------------------------ upload
@@ -1775,6 +1783,14 @@ def _run_ai(job: dict):
             run_stems(job, tmp)
             job["state"] = "done"
             return
+        if job["kind"] == "tags":
+            run_tags(job)
+            job["state"] = "done"
+            return
+        if job["kind"] == "translate":
+            run_translate(job)
+            job["state"] = "done"
+            return
         if job["kind"] == "split":
             with db() as con:
                 row = con.execute("SELECT * FROM tracks WHERE id=?",
@@ -2278,10 +2294,11 @@ def delete_track(tid: int, forever: bool = False):
 @app.get("/api/tracks/{tid}/lyrics")
 def lyrics(tid: int, refresh: bool = False):
     with db() as con:
-        row = con.execute("SELECT lyrics,lyrics_state,lyrics_offset FROM tracks "
-                          "WHERE id=?", (tid,)).fetchone()
+        row = con.execute("SELECT lyrics,lyrics_state,lyrics_offset,lyrics_tr "
+                          "FROM tracks WHERE id=?", (tid,)).fetchone()
     if not row:
         raise HTTPException(404)
+    tr = json.loads(row["lyrics_tr"]) if row["lyrics_tr"] else None
     if refresh or not row["lyrics_state"]:
         try:
             state, text = fetch_lyrics(tid)
@@ -2290,9 +2307,9 @@ def lyrics(tid: int, refresh: bool = False):
         except Exception as e:
             raise HTTPException(502, f"Lyrics lookup failed: {clean_err(e)}")
         return {"state": state, "lyrics": text,
-                "offset": row["lyrics_offset"] or 0}
+                "offset": row["lyrics_offset"] or 0, "tr": tr}
     return {"state": row["lyrics_state"], "lyrics": row["lyrics"],
-            "offset": row["lyrics_offset"] or 0}
+            "offset": row["lyrics_offset"] or 0, "tr": tr}
 
 
 @app.put("/api/tracks/{tid}/lyrics")
@@ -2398,7 +2415,8 @@ def cover(tid: int):
 def playlists():
     with db() as con:
         return [dict(r) for r in con.execute(
-            "SELECT p.id,p.name,p.source, (SELECT COUNT(*) FROM playlist_tracks "
+            "SELECT p.id,p.name,p.source,COALESCE(p.cover,0) AS cover,"
+            "(SELECT COUNT(*) FROM playlist_tracks "
             "WHERE playlist_id=p.id) AS count FROM playlists p "
             "WHERE COALESCE(p.profile_id,1)=? "
             "ORDER BY p.position IS NULL, p.position, p.name COLLATE NOCASE",
@@ -2427,8 +2445,9 @@ def create_folder(req: NameReq):
         cur = con.execute(
             "INSERT INTO playlists(name,url,source,profile_id) VALUES(?,?,?,?)",
             (name, f"folder:{uuid.uuid4().hex}", "folder", profile_id()))
-        log_act("folder", f"Made the folder “{name}”")
-        return {"id": cur.lastrowid, "name": name}
+        pid = cur.lastrowid
+    log_act("folder", f"Made the folder “{name}”")  # after the write above is saved
+    return {"id": pid, "name": name}
 
 
 @app.patch("/api/playlists/{pid}")
@@ -2678,6 +2697,291 @@ def where(video_id: str):
             "COALESCE(p.profile_id,1)=? ORDER BY p.id LIMIT 1",
             (row["id"], profile_id())).fetchone()
     return {"id": row["id"], "playlist": dict(pl) if pl else None}
+
+
+# ------------------------------------------------- pictures of songs, folders
+# A song's picture can be hidden (and shown again), or replaced by one of
+# your own; a folder can have a picture too.
+class PictureReq(BaseModel):
+    hidden: bool
+
+
+@app.put("/api/tracks/{tid}/picture")
+def track_picture(tid: int, req: PictureReq):
+    """Hide a song's picture (and its video) everywhere, or show it again."""
+    with db() as con:
+        con.execute("UPDATE tracks SET nocover=? WHERE id=?",
+                    (1 if req.hidden else 0, tid))
+    return {"ok": True}
+
+
+async def save_picture(request: Request, dest: Path):
+    data = await request.body()
+    if not data or len(data) > 15_000_000:
+        raise HTTPException(400, "Choose a picture smaller than 15 MB")
+    COVERS.mkdir(parents=True, exist_ok=True)
+    raw = dest.with_suffix(".upload")
+    raw.write_bytes(data)
+    r = await run_in_threadpool(lambda: subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", "-i", str(raw), "-frames:v", "1",
+         "-vf", "scale='min(900,iw)':-2", "-q:v", "3", str(dest)],
+        capture_output=True, text=True, timeout=60))
+    raw.unlink(missing_ok=True)
+    if r.returncode or not dest.exists():
+        raise HTTPException(400, "That file is not a picture")
+
+
+@app.post("/api/tracks/{tid}/cover")
+async def track_cover_set(tid: int, request: Request):
+    await save_picture(request, COVERS / f"c_{tid}.jpg")
+    with db() as con:
+        con.execute("UPDATE tracks SET ccover=? WHERE id=?",
+                    (int(time.time()), tid))
+    return {"ok": True}
+
+
+@app.delete("/api/tracks/{tid}/cover")
+def track_cover_reset(tid: int):
+    (COVERS / f"c_{tid}.jpg").unlink(missing_ok=True)
+    with db() as con:
+        con.execute("UPDATE tracks SET ccover=0 WHERE id=?", (tid,))
+    return {"ok": True}
+
+
+@app.get("/api/tracks/{tid}/cover")
+def track_cover(tid: int):
+    path = COVERS / f"c_{tid}.jpg"
+    if not path.exists():
+        raise HTTPException(404)
+    return FileResponse(path, media_type="image/jpeg")
+
+
+@app.post("/api/playlists/{pid}/cover")
+async def folder_cover_set(pid: int, request: Request):
+    await save_picture(request, COVERS / f"pl_{pid}.jpg")
+    with db() as con:
+        con.execute("UPDATE playlists SET cover=? WHERE id=?",
+                    (int(time.time()), pid))
+    return {"ok": True}
+
+
+@app.delete("/api/playlists/{pid}/cover")
+def folder_cover_reset(pid: int):
+    (COVERS / f"pl_{pid}.jpg").unlink(missing_ok=True)
+    with db() as con:
+        con.execute("UPDATE playlists SET cover=0 WHERE id=?", (pid,))
+    return {"ok": True}
+
+
+@app.get("/api/playlists/{pid}/cover")
+def folder_cover(pid: int):
+    path = COVERS / f"pl_{pid}.jpg"
+    if not path.exists():
+        raise HTTPException(404)
+    return FileResponse(path, media_type="image/jpeg")
+
+
+# ------------------------------------------------------------------- albums
+# Which album a song is from is looked up once per song (iTunes Search, no
+# account needed), slowly in the background so the service is not flooded.
+def lookup_album(title: str, artist: str, source: str):
+    title, artist = clean_title(title, artist, source)
+    if not artist or not title:
+        return "", ""
+    q = urllib.parse.urlencode({"term": f"{artist} {title}", "entity": "song",
+                                "limit": 5})
+    res = json.loads(http("https://itunes.apple.com/search?" + q)).get(
+        "results") or []
+    simple = lambda s: re.sub(r"[\W_]+", "", (s or "").lower())
+    for r in res:
+        same_title = (simple(title) in simple(r.get("trackName"))
+                      or simple(r.get("trackName")) in simple(title))
+        same_artist = (simple(artist.split(",")[0]) in simple(r.get("artistName"))
+                       or simple(r.get("artistName")) in simple(artist))
+        if same_title and same_artist and r.get("collectionName"):
+            name = re.sub(r"\s*-\s*(Single|EP)$", "", r["collectionName"])
+            return name, (r.get("releaseDate") or "")[:4]
+    return "", ""
+
+
+def album_worker():
+    while True:
+        try:
+            with db() as con:
+                rows = con.execute(
+                    "SELECT id,title,artist,source FROM tracks WHERE status="
+                    "'ready' AND album IS NULL AND source IN ('youtube',"
+                    "'spotify','upload') LIMIT 5").fetchall()
+            if not rows:
+                time.sleep(60)
+                continue
+            for r in rows:
+                try:
+                    album, year = lookup_album(r["title"], r["artist"] or "",
+                                               r["source"])
+                except Exception:
+                    time.sleep(30)   # offline or asked to slow down: try later
+                    continue
+                with db() as con:
+                    con.execute("UPDATE tracks SET album=?,year=? WHERE id=?",
+                                (album, year, r["id"]))
+                time.sleep(3.5)
+        except Exception:
+            time.sleep(60)
+
+
+@app.get("/api/albums")
+def albums():
+    """The albums in this profile's library that have at least two songs,
+    then the ones with a single song."""
+    with db() as con:
+        rows = con.execute(
+            "SELECT t.album,t.year,t.artist,t.id,t.video_id,t.source,t.nocover,"
+            "t.ccover,t.title FROM tracks t JOIN library lb ON lb.track_id=t.id "
+            "AND lb.profile_id=? WHERE t.status='ready' AND COALESCE(t.album,'')"
+            "!='' ORDER BY t.id", (profile_id(),)).fetchall()
+        waiting = con.execute(
+            "SELECT COUNT(*) c FROM tracks t JOIN library lb ON lb.track_id=t.id "
+            "AND lb.profile_id=? WHERE t.status='ready' AND t.album IS NULL "
+            "AND t.source IN ('youtube','spotify','upload')",
+            (profile_id(),)).fetchone()["c"]
+    groups: dict = {}
+    for r in rows:
+        g = groups.setdefault(r["album"].lower(), {
+            "album": r["album"], "year": r["year"], "artist": r["artist"],
+            "count": 0, "cover": dict(r)})
+        g["count"] += 1
+    out = sorted(groups.values(), key=lambda g: (-g["count"], g["album"].lower()))
+    return {"albums": out, "waiting": waiting}
+
+
+# ------------------------------------------ AI tags: genre, mood, tempo, language
+def guess_language(text: str) -> str:
+    """The language of a text from its letters (good enough to pick a
+    translation direction and a tag)."""
+    t = text or ""
+    count = lambda pat: len(re.findall(pat, t))
+    if count(r"[؀-ۿ]") > 3:
+        return "ar"
+    if count(r"[Ѐ-ӿ]") > 3:
+        return "ru"
+    if count(r"[가-힯]") > 2:
+        return "ko"
+    if count(r"[぀-ヿ]") > 2:
+        return "ja"
+    if count(r"[ऀ-ॿ]") > 3:
+        return "hi"
+    if count(r"[ğĞşŞıİ]") > 0:
+        return "tr"
+    if count(r"[ñ¿¡]") > 0:
+        return "es"
+    if count(r"[ãõ]") > 0:
+        return "pt"
+    if count(r"[ß]") > 0 or count(r"[äÄ]") > 1:
+        return "de"
+    if count(r"[àâèêëîïôûùœç]") > 2:
+        return "fr"
+    return "en" if count(r"[A-Za-z]") > 3 else ""
+
+
+LANG_NAMES = {"ar": "Arabic", "tr": "Turkish", "en": "English", "es": "Spanish",
+              "fr": "French", "de": "German", "ru": "Russian", "hi": "Hindi",
+              "ko": "Korean", "ja": "Japanese", "pt": "Portuguese",
+              "it": "Italian", "fa": "Persian", "ur": "Urdu", "id": "Indonesian"}
+
+
+@app.post("/api/tags/scan")
+def tags_scan():
+    """Have the AI listen to every song that has no tags yet."""
+    with db() as con:
+        n = con.execute("SELECT COUNT(*) c FROM tracks WHERE status='ready' AND "
+                        "file IS NOT NULL AND tags IS NULL").fetchone()["c"]
+    if n and not any(j["kind"] == "tags" and j["state"] in ("queued", "working")
+                     for j in ai_jobs):
+        ai_queue({"kind": "tags", "label": f"{n} song{'' if n == 1 else 's'}"})
+    return {"count": n}
+
+
+def run_tags(job: dict):
+    with db() as con:
+        rows = con.execute(
+            "SELECT id,title,artist,file,lyrics FROM tracks WHERE status='ready' "
+            "AND file IS NOT NULL AND tags IS NULL").fetchall()
+    done = 0
+    for r in rows:
+        job["label"] = f"song {done + 1} of {len(rows)}: {r['title']}"
+        try:
+            res = ai_call("/describe", {"src": str(MUSIC / Path(r["file"]).name)},
+                          1800)
+        except Exception as e:
+            if done == 0:
+                raise
+            res = {}
+        words = re.sub(r"\[[^\]]*\]", " ", r["lyrics"] or "")
+        lang = guess_language(words)
+        if not lang:  # no lyrics: a title in Latin letters says nothing sure
+            lang = guess_language(f"{r['title']} {r['artist'] or ''}")
+            lang = "" if lang == "en" else lang
+        tags = {"genre": res.get("genre") or [], "mood": res.get("mood") or "",
+                "language": LANG_NAMES.get(lang, "")}
+        with db() as con:
+            con.execute("UPDATE tracks SET tags=?,bpm=?,beat0=? WHERE id=?",
+                        (json.dumps(tags), res.get("bpm"), res.get("first"),
+                         r["id"]))
+        done += 1
+    notify(f"Tagged {done} song{'' if done == 1 else 's'} with genre, mood, "
+           "tempo and language")
+
+
+# --------------------------------------------------------- lyrics translation
+class TranslateReq(BaseModel):
+    target: str = "en"
+
+
+@app.post("/api/tracks/{tid}/lyrics/translate")
+def lyrics_translate(tid: int, req: TranslateReq):
+    if req.target not in LANG_NAMES:
+        raise HTTPException(400, "Unknown language")
+    with db() as con:
+        row = con.execute("SELECT title,lyrics FROM tracks WHERE id=?",
+                          (tid,)).fetchone()
+    if not row or not row["lyrics"]:
+        raise HTTPException(404, "This song has no lyrics to translate")
+    return ai_queue({"kind": "translate", "track_id": tid, "label": row["title"],
+                     "target": req.target})
+
+
+def lyric_lines(text: str) -> list:
+    out = []
+    for line in (text or "").split("\n"):
+        s = re.sub(r"\[[^\]]*\]|<\d+:\d+(?:\.\d+)?>", "", line)
+        s = re.sub(r"\s+", " ", s).strip()
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+def run_translate(job: dict):
+    with db() as con:
+        row = con.execute("SELECT id,title,lyrics FROM tracks WHERE id=?",
+                          (job["track_id"],)).fetchone()
+    if not row or not row["lyrics"]:
+        raise RuntimeError("That song has no lyrics any more")
+    lines = lyric_lines(row["lyrics"])[:400]
+    source = guess_language(" ".join(lines)) or "en"
+    if source == job["target"]:
+        raise RuntimeError(f"The lyrics of “{row['title']}” are already in "
+                           f"{LANG_NAMES[source]}")
+    res = ai_call("/translate", {"lines": lines, "source": source,
+                                 "target": job["target"]}, 3600)
+    out = res.get("lines") or []
+    if len(out) != len(lines):
+        raise RuntimeError("The translation came back incomplete")
+    with db() as con:
+        con.execute("UPDATE tracks SET lyrics_tr=? WHERE id=?", (json.dumps({
+            "lang": job["target"], "map": dict(zip(lines, out))}), row["id"]))
+    notify(f"The lyrics of “{row['title']}” are translated to "
+           f"{LANG_NAMES[job['target']]}")
 
 
 # ------------------------------------------------------------ even loudness
@@ -3157,7 +3461,7 @@ def cleanup():
     with db() as con:
         rows = [dict(r) for r in con.execute(
             "SELECT t.id,t.title,t.artist,t.duration,t.source,t.video_id,"
-            "t.status,t.error,t.kind,t.file,t.video_file,"
+            "t.status,t.error,t.kind,t.file,t.video_file,t.nocover,t.ccover,"
             "(SELECT COALESCE(SUM(plays),0) FROM profile_tracks WHERE "
             "track_id=t.id) AS plays,"
             "(SELECT COALESCE(MAX(liked),0) FROM profile_tracks WHERE "
@@ -3351,10 +3655,12 @@ class FreshStatic(StaticFiles):
 
 @app.get("/")
 def index():
-    ver = int(max((STATIC / n).stat().st_mtime for n in ("app.js", "style.css")))
+    # every script and the style sheet get the time of the newest file in
+    # their address, so a browser never keeps running an old copy
+    files = [STATIC / "style.css", *(STATIC / "js").glob("*.js")]
+    ver = int(max(f.stat().st_mtime for f in files))
     html = (STATIC / "index.html").read_text("utf-8")
-    html = html.replace('"style.css"', f'"style.css?v={ver}"').replace(
-        '"app.js"', f'"app.js?v={ver}"')
+    html = re.sub(r'"((?:js/)?[\w.-]+\.(?:js|css))"', rf'"\1?v={ver}"', html)
     return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 
