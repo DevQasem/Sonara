@@ -744,3 +744,10 @@ body.kid #uploadBtn,body.kid #saveBtn,body.kid #npSave,body.kid #drop{display:no
 .card-bar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;justify-content:center}
 .card-note{flex:1;color:var(--mute);font-size:12px;text-align:left}
 .card-dlg .dlg-act{flex-wrap:wrap;align-items:center}
+
+/* ---- double-click the cover or video to skip 10 seconds ---- */
+@keyframes skipTip{0%{opacity:0;transform:translateY(-50%) scale(.8)}25%{opacity:1;transform:translateY(-50%) scale(1)}100%{opacity:0;transform:translateY(-50%) scale(1.05)}}
+.skip-tip{position:absolute;top:50%;z-index:3;padding:10px 16px;border-radius:999px;background:rgba(0,0,0,.62);color:#fff;font-weight:700;font-size:14px;pointer-events:none;white-space:nowrap;animation:skipTip .7s ease both;backdrop-filter:blur(6px)}
+.skip-tip.left{left:6%}
+.skip-tip.right{right:6%}
+.art-wrap{-webkit-user-select:none;user-select:none;touch-action:manipulation}

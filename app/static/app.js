@@ -1937,9 +1937,40 @@ audio.onerror = () => { const t = current(); if (t) toast(t.id ? 'Could not play
 $('saveBtn').onclick = $('npSave').onclick = () => { const t = current(); if (t && !t.id) saveStream(t); };
 $('likeBtn').onclick = $('npLike').onclick = () => { const t = current(); if (t && t.id) toggleLike(t); };
 $('fsBtn').onclick = () => { (audio.requestFullscreen || audio.webkitEnterFullscreen || (() => {})).call(audio); };
-audio.ondblclick = () => $('fsBtn').onclick();
 document.addEventListener('fullscreenchange', () => { audio.controls = document.fullscreenElement === audio; });
-audio.onclick = () => toggle();
+// Clicks on the cover or the video. Double-click (or double-tap) the left
+// third to go back 10 seconds and the right third to go forward 10; keep
+// tapping to keep skipping. The middle: one click plays or pauses a video,
+// two make it full screen.
+const SKIP = 10;
+{
+  const wrap = $('artWrap');
+  let last = 0, lastSide = 0, timer = 0, total = 0;
+  const tip = side => {
+    wrap.querySelector('.skip-tip')?.remove();
+    const d = el('div', 'skip-tip ' + (side < 0 ? 'left' : 'right'), (side < 0 ? '« ' : '') + Math.abs(total) + ' seconds' + (side > 0 ? ' »' : ''));
+    wrap.append(d);
+    setTimeout(() => d.remove(), 700);
+  };
+  wrap.addEventListener('click', e => {
+    if (!current() || e.target.closest('button')) return;
+    const full = document.fullscreenElement === audio, r = (full ? audio : wrap).getBoundingClientRect();
+    const x = (e.clientX - r.left) / r.width, side = x < 0.35 ? -1 : x > 0.65 ? 1 : 0, now = performance.now();
+    const again = now - last < 350 && side === lastSide;
+    last = now; lastSide = side;
+    clearTimeout(timer);
+    if (again && side) {
+      const d = isFinite(audio.duration) ? audio.duration : 0, to = Math.max(0, Math.min(d ? d - 0.5 : Infinity, audio.currentTime + side * SKIP));
+      total = (Math.sign(total) === side ? total : 0) + side * SKIP;
+      audio.currentTime = to; tip(side);
+      return;
+    }
+    total = 0;
+    if (again) { last = 0; if (showingVideo()) $('fsBtn').onclick(); return; }
+    // a single click on the video plays or pauses, once it is clear no second one follows
+    if (e.target === audio && !full) timer = setTimeout(toggle, 360);
+  });
+}
 audio.onplay = audio.onpause = () => {
   $$('.js-play').forEach(b => { b.innerHTML = svg(audio.paused ? 'play' : 'pause'); });
   document.body.classList.toggle('playing', !audio.paused);
@@ -2029,12 +2060,25 @@ function ensureEq(force) {
     node.connect(bass); bass.connect(pan); pan.connect(analyser); pan.connect(verb); verb.connect(wet); wet.connect(analyser);
     const boost = actx.createGain(); boost.gain.value = Math.max(prefs.volume, 1);
     analyser.connect(boost); boost.connect(actx.destination);
-    fx = { bass, wet, depth, boost, norm };
+    fx = { bass, wet, depth, boost, norm, pan, verb };
     if (remixOn()) applyRemix();
     applyEq();
     if (!audio.paused) actx.resume();
   } catch { actx = null; }
 }
+// The echo of the reverb lasts a few seconds. After a jump to another time (or
+// another song) that echo would still be of the old place and mix with the
+// new one, so the reverb is swapped for a fresh, silent one.
+function flushReverb() {
+  if (!fx || !fx.verb) return;
+  const fresh = actx.createConvolver();
+  fresh.buffer = fx.verb.buffer;
+  try { fx.pan.disconnect(fx.verb); fx.verb.disconnect(); } catch {}
+  fx.pan.connect(fresh); fresh.connect(fx.wet);
+  fx.verb = fresh;
+}
+audio.addEventListener('seeking', () => { flushReverb(); if (xfading) stopTail(); });
+audio.addEventListener('emptied', flushReverb);
 function applyEq() { if (eqNodes) eqNodes.forEach((n, i) => { n.gain.value = prefs.eqOn ? prefs.eq[i] : 0; }); }
 
 // Visualizer for audio tracks: bars, wave or a ring around the cover.
