@@ -2329,7 +2329,14 @@ async function showLyrics(refresh = false) {
     rows.sort((a, b) => a.time - b.time);
     for (const r of rows) {
       const p = el('p', null, r.text || '♪');
-      p.onclick = () => { audio.currentTime = Math.max(0, r.time + lyOffset); audio.play(); };
+      const idx = lyLines.length;
+      p.onclick = () => {
+        // light the clicked line up at once and keep it lit until the song gets there
+        const to = Math.max(0, r.time + lyOffset);
+        lyHold = { i: idx, until: performance.now() + 2000 };
+        audio.currentTime = to; audio.play();
+        syncLyrics(to);
+      };
       box.append(p); lyLines.push({ time: r.time, p });
     }
     paintOffset();
@@ -2339,11 +2346,12 @@ async function showLyrics(refresh = false) {
     for (const line of d.lyrics.split('\n')) box.append(el('p', null, line || ' '));
   }
 }
-let lyOffset = 0, lyRaf = 0, lyOffTimer;
+let lyOffset = 0, lyRaf = 0, lyOffTimer, lyHold = null;
 function syncLyrics(t) {
   if (!lyLines.length || !npOpen()) return;
   let i = -1;
   for (let k = 0; k < lyLines.length && lyLines[k].time + lyOffset <= t + 0.1; k++) i = k;
+  if (lyHold) { if (performance.now() > lyHold.until || i >= lyHold.i || !lyLines[lyHold.i]) lyHold = null; else i = lyHold.i; }
   if (i === lyActive) return;
   if (lyActive >= 0 && lyLines[lyActive]) lyLines[lyActive].p.classList.remove('on');
   lyActive = i;
@@ -3280,7 +3288,11 @@ $('lyrics').oncontextmenu = e => {
   if (!p || p.classList.contains('msg') || p.parentNode !== $('lyrics')) return;
   e.preventDefault();
   const i = [...$('lyrics').children].filter(x => !x.classList.contains('msg')).indexOf(p);
-  openMenu(at(e), [{ icon: 'lyrics', label: 'Make a lyric card from this line', fn: () => lyricCard(i) }], 'Lyrics');
+  const items = [];
+  // lyrics that run early or late: say "this line is being sung now" and all lines move with it
+  if (lyLines[i] && lyLines.length === $('lyrics').querySelectorAll('p:not(.msg)').length) items.push({ icon: 'history', label: 'This line is being sung now (fix the timing)', fn: () => { nudgeLyrics(audio.currentTime - lyLines[i].time - lyOffset); toast('Lyrics timing moved for this song'); } });
+  items.push({ icon: 'lyrics', label: 'Make a lyric card from this line', fn: () => lyricCard(i) });
+  openMenu(at(e), items, 'Lyrics');
 };
 $('lyCard').onclick = () => lyricCard(lyActive >= 0 ? lyActive : 0);
 
